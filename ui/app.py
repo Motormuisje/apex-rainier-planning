@@ -39,6 +39,7 @@ from ui.replay import (
 from ui.routes.config import create_config_blueprint
 from ui.routes.license import create_license_blueprint
 from ui.routes.machines import create_machines_blueprint
+from ui.routes.pap import create_pap_blueprint
 from ui.routes.read import create_read_blueprint
 from ui.engine_rebuild import (
     build_clean_engine_for_session,
@@ -278,6 +279,16 @@ app.register_blueprint(create_machines_blueprint(
     lambda engine, sess: _recalculate_capacity_and_values(engine, sess),
     _planning_value_payload,
     _save_sessions_to_disk,
+))
+app.register_blueprint(create_pap_blueprint(
+    lambda: _get_active(),
+    _global_config,
+    _format_purchased_and_produced,
+    _ensure_reset_baseline,
+    lambda engine, material_number: _recalc_pap_material(engine, material_number),
+    lambda engine: _finish_pap_recalc(engine),
+    _save_global_config,
+    _moq_warnings_payload,
 ))
 
 
@@ -1875,65 +1886,6 @@ def _finish_pap_recalc(current_engine):
     """Run capacity + value engines after a PAP fraction change."""
     sess = sessions.get(active_session_id) if active_session_id else None
     _recalculate_capacity_and_values(current_engine, sess)
-
-
-@app.route('/api/pap', methods=['GET'])
-def get_pap():
-    _, current_engine = _get_active()
-    if current_engine is None:
-        return jsonify({'error': 'No calculations run'}), 400
-    return jsonify({'pap': dict(current_engine.data.purchased_and_produced)})
-
-
-@app.route('/api/pap', methods=['POST'])
-def set_pap():
-    global _global_config
-    sess, current_engine = _get_active()
-    if current_engine is None:
-        return jsonify({'error': 'No calculations run'}), 400
-    req = request.get_json() or {}
-    mat = req.get('material_number', '').strip()
-    fraction = req.get('fraction')
-    if not mat:
-        return jsonify({'error': 'material_number is required'}), 400
-    try:
-        fraction = float(fraction)
-    except (TypeError, ValueError):
-        return jsonify({'error': 'fraction must be a number'}), 400
-    _ensure_reset_baseline(sess, current_engine)
-    current_engine.data.purchased_and_produced[mat] = fraction
-    _global_config['purchased_and_produced'] = _format_purchased_and_produced(
-        current_engine.data.purchased_and_produced
-    )
-    _recalc_pap_material(current_engine, mat)
-    _finish_pap_recalc(current_engine)
-    _save_global_config()
-    results_dict = {lt: [r.to_dict() for r in rs] for lt, rs in current_engine.results.items()}
-    value_results_dict = {lt: [r.to_dict() for r in rs] for lt, rs in current_engine.value_results.items()}
-    consolidation = [r.to_dict() for r in current_engine.value_results.get(LineType.CONSOLIDATION.value, [])]
-    return jsonify({'success': True, 'results': results_dict, 'value_results': value_results_dict,
-                    'consolidation': consolidation, **_moq_warnings_payload(current_engine)})
-
-
-@app.route('/api/pap/<material_number>', methods=['DELETE'])
-def delete_pap(material_number):
-    global _global_config
-    sess, current_engine = _get_active()
-    if current_engine is None:
-        return jsonify({'error': 'No calculations run'}), 400
-    _ensure_reset_baseline(sess, current_engine)
-    current_engine.data.purchased_and_produced.pop(material_number, None)
-    _global_config['purchased_and_produced'] = _format_purchased_and_produced(
-        current_engine.data.purchased_and_produced
-    )
-    _recalc_pap_material(current_engine, material_number)
-    _finish_pap_recalc(current_engine)
-    _save_global_config()
-    results_dict = {lt: [r.to_dict() for r in rs] for lt, rs in current_engine.results.items()}
-    value_results_dict = {lt: [r.to_dict() for r in rs] for lt, rs in current_engine.value_results.items()}
-    consolidation = [r.to_dict() for r in current_engine.value_results.get(LineType.CONSOLIDATION.value, [])]
-    return jsonify({'success': True, 'results': results_dict, 'value_results': value_results_dict,
-                    'consolidation': consolidation, **_moq_warnings_payload(current_engine)})
 
 
 # ---- Scenario endpoints ----
