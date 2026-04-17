@@ -36,6 +36,7 @@ from ui.replay import (
     recalculate_value_results,
     replay_pending_edits,
 )
+from ui.routes.license import create_license_blueprint
 from ui.engine_rebuild import (
     build_clean_engine_for_session,
     get_config_overrides,
@@ -80,7 +81,7 @@ from modules.models import LineType
 from modules.cycle_manager import CycleManager
 from modules.mom_comparison_engine import MoMComparisonEngine
 from modules.database_exporter import DatabaseExporter
-from modules.license_manager import LicenseManager, LicenseStatus
+from modules.license_manager import LicenseManager
 
 _license = LicenseManager(APP_DATA_ROOT)
 
@@ -92,6 +93,7 @@ app = Flask(
 # Allow large Excel uploads (512 MB). Without this, Flask returns a 413 that
 # often surfaces on the client as "TypeError: Failed to fetch".
 app.config['MAX_CONTENT_LENGTH'] = 512 * 1024 * 1024
+app.register_blueprint(create_license_blueprint(_license))
 
 
 @app.errorhandler(413)
@@ -317,62 +319,9 @@ def _get_active():
     return sess, sess.get('engine')
 
 
-_LICENSE_EXEMPT = {'/accept', '/api/license/status', '/api/license/activate'}
-
-
-@app.before_request
-def _check_license():
-    if request.path in _LICENSE_EXEMPT or request.path.startswith('/static'):
-        return None
-    status, info = _license.check()
-    if status == LicenseStatus.NOT_ACTIVATED:
-        if request.path.startswith('/api/'):
-            return jsonify({'error': 'license_required', 'message': 'Trial not yet activated.'}), 403
-        return render_template('accept.html', mode='accept')
-    if status == LicenseStatus.EXPIRED:
-        if request.path.startswith('/api/'):
-            return jsonify({'error': 'license_expired', 'message': 'Trial period has ended.'}), 403
-        return render_template('accept.html', mode='expired', info=info)
-    if status == LicenseStatus.TAMPERED:
-        if request.path.startswith('/api/'):
-            return jsonify({'error': 'license_invalid', 'message': 'License record is invalid.'}), 403
-        return render_template('accept.html', mode='tampered')
-    return None
-
-
 @app.route('/')
 def index():
     return render_template('index.html')
-
-
-@app.route('/accept')
-def accept_page():
-    status, info = _license.check()
-    if status == LicenseStatus.OK:
-        from flask import redirect
-        return redirect('/')
-    mode = 'accept' if status == LicenseStatus.NOT_ACTIVATED else status
-    return render_template('accept.html', mode=mode, info=info)
-
-
-@app.route('/api/license/status', methods=['GET'])
-def license_status():
-    status, info = _license.check()
-    return jsonify({'status': status, 'info': info})
-
-
-@app.route('/api/license/activate', methods=['POST'])
-def license_activate():
-    status, _ = _license.check()
-    if status == LicenseStatus.EXPIRED:
-        return jsonify({'success': False, 'error': 'Trial period has already expired.'}), 403
-    if status == LicenseStatus.TAMPERED:
-        return jsonify({'success': False, 'error': 'License record is corrupt.'}), 403
-    ok = _license.activate()
-    if ok:
-        _, info = _license.check()
-        return jsonify({'success': True, 'info': info})
-    return jsonify({'success': False, 'error': 'Activation failed.'}), 500
 
 
 @app.route('/api/config/folders', methods=['GET'])
