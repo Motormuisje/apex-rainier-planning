@@ -1,12 +1,9 @@
 ﻿"""S&OP Planning Engine - Flask Web UI"""
 
-from flask import Flask, render_template, request, jsonify
-import pandas as pd
+from flask import Flask, request, jsonify
 from pathlib import Path
-from datetime import datetime
 import sys
 import io
-import copy
 import os
 import contextlib
 
@@ -17,7 +14,6 @@ from ui.parsers import (
 )
 from ui.paths import default_app_data_root, default_folders, resource_root
 from ui.serializers import (
-    json_safe as _json_safe,
     moq_warnings_payload as _moq_warnings_payload,
     planning_value_payload as _planning_value_payload,
     row_payload as _row_payload,
@@ -44,6 +40,7 @@ from ui.routes.pap import create_pap_blueprint
 from ui.routes.read import create_read_blueprint
 from ui.routes.scenarios import create_scenarios_blueprint
 from ui.routes.sessions import create_sessions_blueprint
+from ui.routes.workflow import create_workflow_blueprint
 from ui.engine_rebuild import (
     build_clean_engine_for_session,
     get_config_overrides,
@@ -107,8 +104,6 @@ def _too_large(e):
         'error': 'Bestand is te groot voor upload (limiet 512 MB). Comprimeer of splits het bestand.',
         'error_kind': 'too_large',
     }), 413
-
-import uuid as _uuid
 
 sessions: dict = {}           # session_id -> session dict
 active_session_id: str = None  # currently selected session
@@ -347,6 +342,20 @@ app.register_blueprint(create_edits_blueprint(
     _build_clean_engine_for_session,
     _install_clean_engine_baseline,
 ))
+app.register_blueprint(create_workflow_blueprint(
+    sessions,
+    lambda session_id: _set_active_session_id(session_id),
+    lambda: _get_active(),
+    lambda: APP_UPLOADS_DIR,
+    _global_config,
+    _classify_upload_exception,
+    _get_config_overrides,
+    lambda: _cycle_manager,
+    _install_clean_engine_baseline,
+    lambda sess, engine: _replay_pending_edits(sess, engine),
+    _save_sessions_to_disk,
+    lambda: app.app_context(),
+))
 
 
 def _replay_pending_edits(sess, engine):
@@ -434,381 +443,6 @@ def _get_active():
 def _set_active_session_id(session_id):
     global active_session_id
     active_session_id = session_id
-
-
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-
-@app.route('/api/upload', methods=['POST'])
-def upload_file():
-    global sessions, active_session_id
-
-    upload_dir = APP_UPLOADS_DIR
-    upload_dir.mkdir(exist_ok=True)
-    requested_name = (request.form.get('custom_name') or '').strip() or None
-    requested_planning_month = (request.form.get('planning_month') or '').strip()
-    try:
-        requested_actuals = int(request.form.get('months_actuals')) if request.form.get('months_actuals') not in (None, '') else None
-    except (TypeError, ValueError):
-        requested_actuals = None
-    try:
-        requested_forecast = int(request.form.get('months_forecast')) if request.form.get('months_forecast') not in (None, '') else None
-    except (TypeError, ValueError):
-        requested_forecast = None
-
-    # Detect multi-file mode vs single-file mode
-    extract_keys = ['bom_file', 'routing_file', 'stock_file', 'forecast_file']
-    is_multi = all(k in request.files for k in extract_keys)
-
-    if is_multi:
-        # --- Multi-file upload mode ---
-        # Use master file from global config; optional per-request base_file overrides it
-        if 'base_file' in request.files and request.files['base_file'].filename != '':
-            base_f = request.files['base_file']
-            base_file_path = upload_dir / base_f.filename
-            try:
-                base_f.save(str(base_file_path))
-            except Exception as e:
-                return jsonify(_classify_upload_exception(e, 'opslaan base-file')), 400
-        elif _global_config.get('master_file') and Path(_global_config['master_file']).exists():
-            base_file_path = Path(_global_config['master_file'])
-        else:
-            return jsonify({'error': 'No master data file configured. Upload a base file in the Config tab first.'}), 400
-
-        # Keywords that must appear in the filename for each file type (case-insensitive)
-        filename_keywords = {
-            'bom_file':      ['bom'],
-            'routing_file':  ['routing'],
-            'stock_file':    ['stock'],
-            'forecast_file': ['forecast'],
-        }
-        field_labels = {
-            'bom_file': 'BOM', 'routing_file': 'Routing',
-            'stock_file': 'Stock', 'forecast_file': 'Forecast',
-        }
-
-        saved_paths = {}
-        key_map = {'bom_file': 'bom', 'routing_file': 'routing',
-                    'stock_file': 'stock', 'forecast_file': 'forecast'}
-        for form_key, dict_key in key_map.items():
-            f = request.files[form_key]
-            if f.filename == '':
-                return jsonify({'error': f'No file selected for {form_key}'}), 400
-            fname_lower = f.filename.lower()
-            required_kws = filename_keywords[form_key]
-            if not any(kw in fname_lower for kw in required_kws):
-                label = field_labels[form_key]
-                return jsonify({
-                    'error': (
-                        f'Wrong file for {label} field: "{f.filename}" does not look like a {label} file. '
-                        f'Expected the filename to contain: {", ".join(required_kws)}.'
-                    )
-                }), 400
-            fp = upload_dir / f.filename
-            try:
-                f.save(str(fp))
-            except Exception as e:
-                return jsonify(_classify_upload_exception(e, f'opslaan {form_key}')), 400
-            saved_paths[dict_key] = str(fp)
-
-        try:
-            import io as _io
-            _devnull = _io.StringIO()
-            sys.stdout, _saved = _devnull, sys.stdout
-            try:
-                from modules.data_loader import DataLoader
-                loader = DataLoader(
-                    excel_file=str(base_file_path),
-                    extract_files=saved_paths,
-                    config_overrides=_get_config_overrides(),
-                )
-                loader.load_all()
-            finally:
-                sys.stdout = _saved
-        except Exception as e:
-            import traceback
-            print(f'[upload-multi] load error: {traceback.format_exc()}')
-            return jsonify(_classify_upload_exception(e, 'inlezen extract-bestanden')), 400
-
-        try:
-            # Validate required data after successful load
-            missing = []
-            if not getattr(loader, 'materials', None):
-                missing.append('materials')
-            if not getattr(loader, 'bom', None):
-                missing.append('bom')
-            if not getattr(loader, 'routing', None):
-                missing.append('routing')
-            if not getattr(loader, 'machines', None):
-                missing.append('machines')
-            if not getattr(loader, 'forecasts', None):
-                missing.append('forecasts')
-            if not getattr(loader, 'periods', None):
-                missing.append('periods')
-            if getattr(loader, 'config', None) is None:
-                missing.append('config')
-            if missing:
-                return jsonify({
-                    'error': 'The uploaded file is missing required data. Please check that all expected sheets and columns are present.',
-                    'missing': missing
-                }), 400
-
-            site = getattr(loader.config, 'site', '') or ''
-            _idate = getattr(loader.config, 'initial_date', None)
-            planning_month = requested_planning_month or (_idate.strftime('%Y-%m') if _idate else '')
-            months_actuals = requested_actuals if requested_actuals is not None else getattr(loader, 'forecast_actuals_months', 12)
-            months_forecast = requested_forecast if requested_forecast is not None else getattr(loader.config, 'forecast_months', 12)
-
-            bom_filename = request.files['bom_file'].filename
-            session_id = str(_uuid.uuid4())
-            sessions[session_id] = {
-                'id': session_id,
-                'file_path': str(base_file_path),
-                'extract_files': saved_paths,
-                'filename': bom_filename,
-                'custom_name': requested_name,
-                'engine': None,
-                'value_results': {},
-                'metadata': {
-                    'materials': len(loader.materials),
-                    'bom_items': len(loader.bom),
-                    'machines': len(loader.machines),
-                    'periods': len(loader.periods),
-                    'site': site,
-                    'planning_month': planning_month,
-                },
-                'uploaded_at': datetime.now().isoformat(),
-            }
-            sessions[session_id]['undo_stack'] = []
-            sessions[session_id]['redo_stack'] = []
-            sessions[session_id]['pending_edits'] = {}
-            sessions[session_id]['value_aux_overrides'] = {}
-            sessions[session_id]['machine_overrides'] = {}
-            active_session_id = session_id
-            _save_sessions_to_disk()
-
-            return jsonify({
-                'success': True,
-                'session_id': session_id,
-                'filename': bom_filename,
-                'custom_name': requested_name,
-                'planning_month': planning_month,
-                'months_actuals': months_actuals,
-                'months_forecast': months_forecast,
-                'summary': {
-                    'materials': len(loader.materials),
-                    'bom_items': len(loader.bom),
-                    'machines': len(loader.machines),
-                    'periods': len(loader.periods),
-                }
-            })
-        except Exception as e:
-            import traceback
-            print(f'[upload-multi] session error: {traceback.format_exc()}')
-            return jsonify(_classify_upload_exception(e, 'sessie aanmaken (multi)')), 400
-
-    # --- Single-file upload mode (existing behavior) ---
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file provided'}), 400
-
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': 'No file selected'}), 400
-
-    file_path = upload_dir / file.filename
-    try:
-        file.save(str(file_path))
-    except Exception as e:
-        return jsonify(_classify_upload_exception(e, 'opslaan upload')), 400
-
-    try:
-        _devnull = io.StringIO()
-        sys.stdout, _saved = _devnull, sys.stdout
-        try:
-            from modules.data_loader import DataLoader
-            loader = DataLoader(str(file_path))
-            loader.load_all()
-        finally:
-            sys.stdout = _saved
-    except Exception as e:
-        import traceback
-        print(f'[upload-single] load error: {traceback.format_exc()}')
-        return jsonify(_classify_upload_exception(e, 'inlezen Excel')), 400
-
-    try:
-        # Validate required data after successful load
-        missing = []
-        if not getattr(loader, 'materials', None):
-            missing.append('materials')
-        if not getattr(loader, 'bom', None):
-            missing.append('bom')
-        if not getattr(loader, 'routing', None):
-            missing.append('routing')
-        if not getattr(loader, 'machines', None):
-            missing.append('machines')
-        if not getattr(loader, 'forecasts', None):
-            missing.append('forecasts')
-        if not getattr(loader, 'periods', None):
-            missing.append('periods')
-        if getattr(loader, 'config', None) is None:
-            missing.append('config')
-        if missing:
-            return jsonify({
-                'error': 'The uploaded file is missing required data. Please check that all expected sheets and columns are present.',
-                'missing': missing
-            }), 400
-
-        site = getattr(loader.config, 'site', '') or ''
-        _idate = getattr(loader.config, 'initial_date', None)
-        planning_month = requested_planning_month or (_idate.strftime('%Y-%m') if _idate else '')
-        months_actuals = requested_actuals if requested_actuals is not None else getattr(loader, 'forecast_actuals_months', 12)
-        months_forecast = requested_forecast if requested_forecast is not None else getattr(loader.config, 'forecast_months', 12)
-
-        session_id = str(_uuid.uuid4())
-        sessions[session_id] = {
-            'id': session_id,
-            'file_path': str(file_path),
-            'filename': file.filename,
-            'custom_name': requested_name,
-            'engine': None,
-            'value_results': {},
-            'metadata': {
-                'materials': len(loader.materials),
-                'bom_items': len(loader.bom),
-                'machines': len(loader.machines),
-                'periods': len(loader.periods),
-                'site': site,
-                'planning_month': planning_month,
-            },
-            'uploaded_at': datetime.now().isoformat(),
-        }
-        sessions[session_id]['undo_stack'] = []
-        sessions[session_id]['redo_stack'] = []
-        sessions[session_id]['pending_edits'] = {}
-        sessions[session_id]['value_aux_overrides'] = {}
-        sessions[session_id]['machine_overrides'] = {}
-        active_session_id = session_id
-        _save_sessions_to_disk()
-
-        return jsonify({
-            'success': True,
-            'session_id': session_id,
-            'filename': file.filename,
-            'custom_name': requested_name,
-            'planning_month': planning_month,
-            'months_actuals': months_actuals,
-            'months_forecast': months_forecast,
-            'summary': {
-                'materials': len(loader.materials),
-                'bom_items': len(loader.bom),
-                'machines': len(loader.machines),
-                'periods': len(loader.periods),
-            }
-        })
-    except Exception as e:
-        import traceback
-        print(f'[upload-single] session error: {traceback.format_exc()}')
-        return jsonify(_classify_upload_exception(e, 'sessie aanmaken')), 400
-
-
-@app.route('/api/calculate', methods=['POST'])
-def run_calculations():
-    global sessions
-    sess, _ = _get_active()
-    if sess is None:
-        return jsonify({'error': 'No file uploaded'}), 400
-
-    _log_buf = io.StringIO()
-    _old_stdout = sys.stdout
-    sys.stdout = _log_buf
-
-    try:
-        # Get user input parameters from request (handle both JSON and form data)
-        if request.is_json:
-            req_data = request.get_json() or {}
-        else:
-            req_data = request.form.to_dict() or {}
-
-        planning_month = req_data.get('planning_month', None)
-        months_actuals = int(req_data.get('months_actuals', 0) or 0)
-        months_forecast = int(req_data.get('months_forecast', 12) or 12)
-
-        print("\nUser Input Parameters:")
-        print(f"  Planning Month: {planning_month}")
-        print(f"  Months of Actuals: {months_actuals}")
-        print(f"  Months of Forecast: {months_forecast}")
-
-        # --- MoM: preserve the previous results BEFORE running the new calculation ---
-        # If the active session already has an engine, save its results as the
-        # "previous cycle" snapshot so MoM compares new vs. old (not new vs. new).
-        # If there is no previous snapshot at all (very first calculation ever),
-        # bootstrap one after running so the user only needs one calculation to
-        # enable MoM on the next run.
-        _existing_engine = sess.get('engine')
-        _bootstrap_snapshot = (_existing_engine is None and not _cycle_manager.has_previous_cycle())
-        if _existing_engine is not None:
-            try:
-                _prev_pm = (sess.get('parameters') or {}).get('planning_month')
-                _cycle_manager.save_current_as_previous(_existing_engine.to_dataframe(), planning_month=_prev_pm)
-                print('[cycle_manager] pre-run: saved existing engine as previous cycle snapshot')
-            except Exception as _cm_exc:
-                import traceback
-                print(f'[cycle_manager] pre-run snapshot ERROR (MoM will not work): {_cm_exc}\n{traceback.format_exc()}')
-
-        engine = PlanningEngine(
-            sess['file_path'],
-            planning_month=planning_month,
-            months_actuals=months_actuals,
-            months_forecast=months_forecast,
-            extract_files=sess.get('extract_files'),
-            config_overrides=_get_config_overrides(),
-        )
-        engine.run()
-        _install_clean_engine_baseline(sess, engine)
-        with app.app_context():
-            _replay_pending_edits(sess, engine)
-        sess['engine'] = engine
-        sess['parameters'] = {
-            'planning_month':  planning_month,
-            'months_actuals':  months_actuals,
-            'months_forecast': months_forecast,
-        }
-        # Keep metadata in sync so the Files tab shows the calculated planning month
-        if planning_month and sess.get('metadata') is not None:
-            sess['metadata']['planning_month'] = planning_month
-
-        # --- MoM bootstrap: on the very first calculation ever, seed the snapshot ---
-        # (so MoM becomes available after the second calculation without needing
-        # to calculate twice in the same app session)
-        if _bootstrap_snapshot:
-            try:
-                _cycle_manager.save_current_as_previous(engine.to_dataframe(), planning_month=planning_month)
-                print('[cycle_manager] bootstrap: saved first-ever snapshot')
-            except Exception as _cm_exc:
-                import traceback
-                print(f'[cycle_manager] bootstrap snapshot ERROR (MoM will not work): {_cm_exc}\n{traceback.format_exc()}')
-
-        _save_sessions_to_disk()
-
-        sys.stdout = _old_stdout
-        return jsonify({
-            'success': True,
-            'summary': engine.get_summary(),
-            'log': _log_buf.getvalue(),
-            'parameters': {
-                'planning_month': planning_month,
-                'months_actuals': months_actuals,
-                'months_forecast': months_forecast
-            }
-        })
-    except Exception as e:
-        sys.stdout = _old_stdout
-        import traceback
-        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
-
-
 
 
 def SHIFT_HOURS_LOOKUP_FALLBACK(machine, data):
