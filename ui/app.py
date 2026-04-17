@@ -41,6 +41,7 @@ from ui.routes.license import create_license_blueprint
 from ui.routes.machines import create_machines_blueprint
 from ui.routes.pap import create_pap_blueprint
 from ui.routes.read import create_read_blueprint
+from ui.routes.sessions import create_sessions_blueprint
 from ui.engine_rebuild import (
     build_clean_engine_for_session,
     get_config_overrides,
@@ -290,6 +291,22 @@ app.register_blueprint(create_pap_blueprint(
     _save_global_config,
     _moq_warnings_payload,
 ))
+app.register_blueprint(create_sessions_blueprint(
+    sessions,
+    lambda: active_session_id,
+    lambda session_id: _set_active_session_id(session_id),
+    lambda: _get_active(),
+    _global_config,
+    _machine_overrides_from_engine,
+    _save_sessions_to_disk,
+    _sync_global_config_from_engine,
+    _build_clean_engine_for_session,
+    _install_clean_engine_baseline,
+    lambda sess, engine: _replay_pending_edits(sess, engine),
+    _snapshot_has_manual_edits,
+    _engine_has_manual_edits,
+    lambda: app.app_context(),
+))
 
 
 def _replay_pending_edits(sess, engine):
@@ -372,6 +389,11 @@ def _get_active():
     if not sess:
         return None, None
     return sess, sess.get('engine')
+
+
+def _set_active_session_id(session_id):
+    global active_session_id
+    active_session_id = session_id
 
 
 @app.route('/')
@@ -2284,193 +2306,6 @@ def export_scenario_comparison():
     export_path = export_dir / filename
     wb.save(str(export_path))
     return send_file(str(export_path), as_attachment=True, download_name=filename)
-
-
-# ---- Session management endpoints ----
-
-@app.route('/api/sessions/snapshot', methods=['POST'])
-def snapshot_session():
-    """Duplicate the active session (including all edits) as a new named instance."""
-    global sessions, active_session_id
-    req = request.get_json() or {}
-    name = req.get('name', '').strip()
-    if not name:
-        return jsonify({'error': 'Name cannot be empty'}), 400
-
-    sess, _ = _get_active()
-    if sess is None:
-        return jsonify({'error': 'No active session'}), 400
-
-    new_id = str(_uuid.uuid4())
-    try:
-        engine_copy = copy.deepcopy(sess.get('engine')) if sess.get('engine') is not None else None
-    except Exception:
-        engine_copy = None
-    new_sess = {
-        'id':                 new_id,
-        'file_path':          sess.get('file_path', ''),
-        'extract_files':      sess.get('extract_files'),
-        'filename':           sess.get('filename', ''),
-        'custom_name':        name,
-        'is_snapshot':        True,
-        'engine':             engine_copy,
-        'value_results':      copy.deepcopy(sess.get('value_results', {})),
-        'metadata':           copy.deepcopy(sess.get('metadata', {})),
-        'uploaded_at':        datetime.now().isoformat(),
-        'parameters':         copy.deepcopy(sess.get('parameters')),
-        'pending_edits':      copy.deepcopy(sess.get('pending_edits', {})),
-        'value_aux_overrides': copy.deepcopy(sess.get('value_aux_overrides', {})),
-        'machine_overrides':  _machine_overrides_from_engine(sess, sess.get('engine')) if sess.get('engine') is not None else copy.deepcopy(sess.get('machine_overrides', {})),
-        'reset_baseline':     copy.deepcopy(sess.get('reset_baseline')),
-        'undo_stack':         [],
-        'redo_stack':         [],
-    }
-    sessions[new_id] = new_sess
-    _save_sessions_to_disk()
-
-    meta = new_sess.get('metadata', {})
-    site = meta.get('site', 'Unknown')
-    pm   = str(meta.get('planning_month', '')) or 'Unknown'
-    return jsonify({
-        'success': True,
-        'session': {
-            'id':             new_id,
-            'filename':       new_sess['filename'],
-            'custom_name':    name,
-            'site':           site,
-            'planning_month': pm,
-            'uploaded_at':    new_sess['uploaded_at'],
-            'calculated':     engine_copy is not None,
-            'is_snapshot':    True,
-            'active':         False,
-            'metadata':       meta,
-        }
-    })
-
-
-@app.route('/api/sessions')
-def list_sessions():
-    """Return all sessions grouped by year/month/site."""
-    grouped: dict = {}
-    for sid, sess in sessions.items():
-        meta = sess.get('metadata', {})
-        site = meta.get('site', 'Unknown')
-        pm   = str(meta.get('planning_month', '')) or 'Unknown'
-        year = pm[:4] if len(pm) >= 4 else 'Unknown'
-        month = pm[5:7] if len(pm) >= 7 else 'Unknown'
-        key = f"{year}/{month}/{site}"
-        grouped.setdefault(key, [])
-        grouped[key].append({
-            'id':             sid,
-            'filename':       sess.get('filename', ''),
-            'custom_name':    sess.get('custom_name'),
-            'site':           site,
-            'planning_month': pm,
-            'uploaded_at':    sess.get('uploaded_at', ''),
-            'calculated':     sess.get('engine') is not None,
-            'is_snapshot':    sess.get('is_snapshot', False),
-            'active':         sid == active_session_id,
-            'metadata':       meta,
-        })
-    return jsonify({'active_session_id': active_session_id, 'groups': grouped})
-
-
-@app.route('/api/sessions/rename', methods=['POST'])
-def rename_session():
-    data = request.get_json() or {}
-    session_id = data.get('session_id', '')
-    new_name = data.get('name', '').strip()
-    if not session_id or session_id not in sessions:
-        return jsonify({'error': 'Session not found'}), 404
-    if not new_name:
-        return jsonify({'error': 'Name cannot be empty'}), 400
-    sessions[session_id]['custom_name'] = new_name
-    _save_sessions_to_disk()
-    sess = sessions[session_id]
-    return jsonify({
-        'success': True,
-        'session_id': session_id,
-        'custom_name': new_name,
-        'session': {
-            'id': sess.get('id', session_id),
-            'filename': sess.get('filename', ''),
-            'custom_name': sess.get('custom_name'),
-            'metadata': sess.get('metadata', {}),
-            'uploaded_at': sess.get('uploaded_at', ''),
-            'planning_month': (sess.get('metadata') or {}).get('planning_month', ''),
-            'calculated': sess.get('engine') is not None,
-        }
-    })
-
-
-@app.route('/api/sessions/switch', methods=['POST'])
-def switch_session():
-    """Set a different session as active. Returns session metadata."""
-    global active_session_id
-    req = request.get_json() or {}
-    sid = req.get('session_id')
-    if not sid or sid not in sessions:
-        return jsonify({'error': 'Session not found'}), 404
-    sess = sessions[sid]
-    # Sync _global_config from the target session's engine BEFORE any rebuilds so
-    # that _build_clean_engine_for_session picks up the correct per-session PAP and
-    # VP params instead of the previous session's values from _global_config.
-    if sess.get('engine') is not None:
-        _sync_global_config_from_engine(sess.get('engine'))
-    if sess.get('engine') is None and sess.get('parameters') is not None:
-        try:
-            params = sess['parameters']
-            with contextlib.redirect_stdout(io.StringIO()):
-                engine = _build_clean_engine_for_session(sess, params)
-                _install_clean_engine_baseline(sess, engine, clear_machine_overrides=False)
-                with app.app_context():
-                    _replay_pending_edits(sess, engine)
-            sess['engine'] = engine
-        except Exception as exc:
-            return jsonify({'error': f'Could not restore calculations for this session: {exc}'}), 500
-    if sess.get('engine') is not None and (
-        sess.get('reset_baseline') is None or _snapshot_has_manual_edits(sess.get('reset_baseline'))
-    ):
-        try:
-            clean_engine = _build_clean_engine_for_session(sess)
-            if clean_engine is not None:
-                _install_clean_engine_baseline(sess, clean_engine, clear_machine_overrides=False)
-            elif not _engine_has_manual_edits(sess['engine']):
-                _install_clean_engine_baseline(sess, sess['engine'], clear_machine_overrides=False)
-        except Exception:
-            pass
-    # Set active session only after all setup succeeds â€” avoids leaving a broken
-    # session active if the engine rebuild above raised an exception and returned early.
-    active_session_id = sid
-    _sync_global_config_from_engine(sess.get('engine'))
-
-    return jsonify({
-        'success': True,
-        'active_session_id': sid,
-        'filename': sess.get('filename', ''),
-        'custom_name': sess.get('custom_name'),
-        'metadata': sess.get('metadata', {}),
-        'calculated': sess.get('engine') is not None,
-        'pending_edits': sess.get('pending_edits', {}),
-        'value_aux_overrides': sess.get('value_aux_overrides', {}),
-        'machine_overrides': sess.get('machine_overrides', {}),
-        'parameters': sess.get('parameters', {}),
-        'valuation_params': _global_config.get('valuation_params', {}),
-        'purchased_and_produced': _global_config.get('purchased_and_produced', ''),
-    })
-
-
-@app.route('/api/sessions/<session_id>', methods=['DELETE'])
-def delete_session(session_id):
-    """Remove a session. Activates the next available session if deleted was active."""
-    global active_session_id, sessions
-    if session_id not in sessions:
-        return jsonify({'error': 'Session not found'}), 404
-    del sessions[session_id]
-    if active_session_id == session_id:
-        active_session_id = next(iter(sessions), None)
-    _save_sessions_to_disk()
-    return jsonify({'success': True, 'active_session_id': active_session_id})
 
 
 _SESSION_SAVE_PATHS = {
