@@ -36,7 +36,7 @@ from ui.replay import (
     recalculate_value_results,
     replay_pending_edits,
 )
-from ui.routes.config import create_config_folders_blueprint
+from ui.routes.config import create_config_blueprint
 from ui.routes.license import create_license_blueprint
 from ui.engine_rebuild import (
     build_clean_engine_for_session,
@@ -244,11 +244,24 @@ def _apply_folder_paths(uploads_dir: Path, exports_dir: Path, sessions_dir: Path
 _load_global_config()
 _apply_folder_config()
 _load_sessions_from_disk()
-app.register_blueprint(create_config_folders_blueprint(
+app.register_blueprint(create_config_blueprint(
     _default_folders,
     _global_config,
     _save_global_config,
     _apply_folder_paths,
+    lambda: APP_UPLOADS_DIR,
+    lambda: _get_active(),
+    _parse_purchased_and_produced,
+    _valuation_params_from_config,
+    _ensure_reset_baseline,
+    lambda engine, material_number: _recalc_pap_material(engine, material_number),
+    lambda engine: _finish_pap_recalc(engine),
+    lambda engine, sess=None: _recalculate_value_results(engine, sess),
+    _build_clean_engine_for_session,
+    _install_clean_engine_baseline,
+    lambda sess, engine: _replay_pending_edits(sess, engine),
+    _moq_warnings_payload,
+    _value_results_payload,
 ))
 
 
@@ -337,210 +350,6 @@ def _get_active():
 @app.route('/')
 def index():
     return render_template('index.html')
-
-
-@app.route('/api/config', methods=['GET'])
-def get_global_config():
-    fd = _global_config.get('file_defaults', {})
-    return jsonify({
-        'master_filename': _global_config.get('master_filename'),
-        'master_uploaded_at': _global_config.get('master_uploaded_at'),
-        'master_file_exists': bool(
-            _global_config.get('master_file') and
-            Path(_global_config['master_file']).exists()
-        ),
-        'site': _global_config.get('site', ''),
-        'forecast_months': _global_config.get('forecast_months', ''),
-        'unlimited_machines': _global_config.get('unlimited_machines', ''),
-        'purchased_and_produced': _global_config.get('purchased_and_produced', ''),
-        'valuation_params': _global_config.get('valuation_params', {}),
-        'file_defaults': {
-            'site': fd.get('site', ''),
-            'forecast_months': fd.get('forecast_months', 12),
-            'unlimited_machines': fd.get('unlimited_machines', ''),
-            'purchased_and_produced': fd.get('purchased_and_produced', ''),
-            'valuation_params': fd.get('valuation_params', {}),
-        },
-    })
-
-
-@app.route('/api/config/master-file', methods=['POST'])
-def upload_master_file():
-    global _global_config
-    upload_dir = APP_UPLOADS_DIR
-    upload_dir.mkdir(exist_ok=True)
-
-    if 'master_file' not in request.files or request.files['master_file'].filename == '':
-        return jsonify({'error': 'No file provided'}), 400
-
-    f = request.files['master_file']
-    if not f.filename.lower().endswith(('.xlsm', '.xlsx')):
-        return jsonify({'error': 'Only .xlsm or .xlsx files are accepted'}), 400
-
-    dest = upload_dir / f.filename
-    f.save(str(dest))
-
-    # Quick validation: try loading config sheet
-    try:
-        _devnull = io.StringIO()
-        sys.stdout, _saved = _devnull, sys.stdout
-        try:
-            from modules.data_loader import DataLoader
-            loader = DataLoader(excel_file=str(dest))
-            loader.load_all()
-        finally:
-            sys.stdout = _saved
-    except Exception as exc:
-        return jsonify({'error': 'Could not read file. Check that it contains the required sheets.'}), 400
-
-    _global_config['master_file'] = str(dest)
-    _global_config['master_filename'] = f.filename
-    _global_config['master_uploaded_at'] = datetime.now().isoformat()
-
-    # Store the values read from the file so the Config tab can show them as defaults
-    site = getattr(loader.config, 'site', '') if loader.config else ''
-    forecast_months = getattr(loader.config, 'forecast_months', 12) if loader.config else 12
-    unlimited = ','.join(getattr(loader.config, 'unlimited_capacity_machine', []))
-    pp = loader.purchased_and_produced or {}
-    purchased_and_produced_str = ', '.join(f'{k}:{v}' for k, v in pp.items())
-    vp = loader.valuation_params
-    vp_dict = {}
-    if vp:
-        vp_dict = {
-            '1': vp.direct_fte_cost_per_month,
-            '2': vp.indirect_fte_cost_per_month,
-            '3': vp.overhead_cost_per_month,
-            '4': vp.sga_cost_per_month,
-            '5': vp.depreciation_per_year,
-            '6': vp.net_book_value,
-            '7': vp.days_sales_outstanding,
-            '8': vp.days_payable_outstanding,
-        }
-    _global_config['file_defaults'] = {
-        'site': site,
-        'forecast_months': forecast_months,
-        'unlimited_machines': unlimited,
-        'purchased_and_produced': purchased_and_produced_str,
-        'valuation_params': vp_dict,
-    }
-    _save_global_config()
-
-    return jsonify({
-        'success': True,
-        'master_filename': f.filename,
-        'master_uploaded_at': _global_config['master_uploaded_at'],
-        'file_defaults': _global_config['file_defaults'],
-        'summary': {
-            'materials': len(loader.materials),
-            'machines': len(loader.machines),
-        }
-    })
-
-
-@app.route('/api/config/settings', methods=['POST'])
-def save_config_settings():
-    global _global_config
-    data = request.get_json() or {}
-    sess, current_engine = _get_active()
-    value_recalculated = False
-    planning_recalculated = False
-    old_config = {
-        'site': str(_global_config.get('site', '') or ''),
-        'forecast_months': int(_global_config.get('forecast_months', 0) or 0),
-        'unlimited_machines': str(_global_config.get('unlimited_machines', '') or ''),
-    }
-
-    if 'site' in data:
-        _global_config['site'] = data['site'].strip()
-    if 'forecast_months' in data:
-        _global_config['forecast_months'] = int(data['forecast_months'] or 12)
-    if 'unlimited_machines' in data:
-        _global_config['unlimited_machines'] = data['unlimited_machines'].strip()
-
-    structural_config_changed = (
-        str(_global_config.get('site', '') or '') != old_config['site']
-        or int(_global_config.get('forecast_months', 0) or 0) != old_config['forecast_months']
-        or str(_global_config.get('unlimited_machines', '') or '') != old_config['unlimited_machines']
-    )
-
-    if 'purchased_and_produced' in data:
-        _global_config['purchased_and_produced'] = data['purchased_and_produced'].strip()
-        if current_engine is not None and not structural_config_changed:
-            old_pap = dict(getattr(current_engine.data, 'purchased_and_produced', {}) or {})
-            new_pap = _parse_purchased_and_produced(_global_config['purchased_and_produced'])
-            changed_mats = sorted({
-                mat for mat in set(old_pap) | set(new_pap)
-                if abs(float(old_pap.get(mat, -999999999)) - float(new_pap.get(mat, -999999999))) > 1e-9
-            })
-            current_engine.data.purchased_and_produced = new_pap
-            if changed_mats:
-                _ensure_reset_baseline(sess, current_engine)
-                for mat in changed_mats:
-                    _recalc_pap_material(current_engine, mat)
-                _finish_pap_recalc(current_engine)
-                planning_recalculated = True
-            else:
-                _recalculate_value_results(current_engine, sess)
-            value_recalculated = True
-    if 'valuation_params' in data:
-        _global_config['valuation_params'] = {
-            str(k): float(v) for k, v in data['valuation_params'].items() if v is not None
-        }
-        if current_engine is not None and not structural_config_changed and getattr(current_engine, 'data', None) is not None:
-            current_engine.data.valuation_params = _valuation_params_from_config(
-                _global_config['valuation_params']
-            )
-            _recalculate_value_results(current_engine, sess)
-            value_recalculated = True
-
-    if current_engine is not None and structural_config_changed:
-        rebuilt = _build_clean_engine_for_session(sess)
-        if rebuilt is None:
-            return jsonify({'error': 'Could not rebuild active session for the changed config. Recalculate this session first.'}), 400
-        _install_clean_engine_baseline(sess, rebuilt, clear_machine_overrides=False)
-        with app.app_context():
-            _replay_pending_edits(sess, rebuilt)
-        sess['engine'] = rebuilt
-        current_engine = rebuilt
-        planning_recalculated = True
-        value_recalculated = True
-
-    _save_global_config()
-    payload = {'success': True}
-    if current_engine is not None and planning_recalculated:
-        payload['periods'] = list(getattr(current_engine.data, 'periods', []) or [])
-        payload['results'] = {
-            lt: [row.to_dict() for row in rows]
-            for lt, rows in (getattr(current_engine, 'results', {}) or {}).items()
-        }
-        payload.update(_moq_warnings_payload(current_engine))
-    if current_engine is not None and value_recalculated:
-        payload.update(_value_results_payload(current_engine))
-    return jsonify(payload)
-
-
-@app.route('/api/config/reset_vp_params', methods=['POST'])
-def reset_vp_params_to_defaults():
-    """Reset valuation parameters to the Excel default values from the session baseline."""
-    global _global_config
-    sess, current_engine = _get_active()
-    if sess is None:
-        return jsonify({'error': 'No active session'}), 400
-    if current_engine is None:
-        return jsonify({'error': 'No calculations run'}), 400
-
-    baseline_vp = (sess.get('reset_baseline') or {}).get('valuation_params')
-    if not baseline_vp:
-        return jsonify({'error': 'No baseline available â€” run calculations first'}), 400
-
-    current_engine.data.valuation_params = _valuation_params_from_config(baseline_vp)
-    _global_config['valuation_params'] = {str(k): float(v) for k, v in baseline_vp.items()}
-    _recalculate_value_results(current_engine, sess)
-    _save_global_config()
-
-    payload = {'success': True, 'valuation_params': baseline_vp}
-    payload.update(_value_results_payload(current_engine))
-    return jsonify(payload)
 
 
 @app.route('/api/upload', methods=['POST'])
