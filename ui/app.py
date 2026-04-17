@@ -36,6 +36,7 @@ from ui.replay import (
     replay_pending_edits,
 )
 from ui.routes.config import create_config_blueprint
+from ui.routes.exports import create_exports_blueprint
 from ui.routes.license import create_license_blueprint
 from ui.routes.machines import create_machines_blueprint
 from ui.routes.pap import create_pap_blueprint
@@ -84,8 +85,6 @@ sys.path.insert(0, str(RESOURCE_ROOT))
 from modules.planning_engine import PlanningEngine
 from modules.models import LineType
 from modules.cycle_manager import CycleManager
-from modules.mom_comparison_engine import MoMComparisonEngine
-from modules.database_exporter import DatabaseExporter
 from modules.license_manager import LicenseManager
 
 _license = LicenseManager(APP_DATA_ROOT)
@@ -321,6 +320,12 @@ app.register_blueprint(create_scenarios_blueprint(
     _parse_purchased_and_produced,
     _format_purchased_and_produced,
     _row_key_from_obj,
+))
+app.register_blueprint(create_exports_blueprint(
+    lambda: _get_active(),
+    lambda: APP_EXPORTS_DIR,
+    lambda: _cycle_manager,
+    lambda path, engine: _apply_edit_highlights(path, engine),
 ))
 
 
@@ -803,117 +808,6 @@ def SHIFT_HOURS_LOOKUP_FALLBACK(machine, data):
         pass
     return SHIFT_HOURS.get(machine.shift_system, 520.0)
 
-
-
-@app.route('/api/export')
-def export():
-    _, current_engine = _get_active()
-
-    if current_engine is None:
-        return jsonify({'error': 'No calculations run'}), 400
-
-    export_dir = APP_EXPORTS_DIR
-    export_dir.mkdir(exist_ok=True)
-
-    export_path = export_dir / f'SOP_Python_Results_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
-
-    # Build inventory quality engine to pass for Top 10 sheet
-    _iq_engine_export = None
-    try:
-        from modules.inventory_quality_engine import InventoryQualityEngine
-        _iq_engine_export = InventoryQualityEngine(
-            current_engine.data,
-            current_engine.results,
-            current_engine.value_results,
-        )
-    except Exception:
-        pass
-
-    # --- Load previous cycle for MoM comparison sheet ---
-    _prev_df = None
-    try:
-        if _cycle_manager.has_previous_cycle():
-            _prev_df = _cycle_manager.load_previous_cycle()
-            if _prev_df.empty:
-                _prev_df = None
-                print('[export] Previous cycle loaded but empty - MoM sheet skipped')
-            else:
-                print(f'[export] Previous cycle loaded ({len(_prev_df)} rows) - MoM sheet will be included')
-        else:
-            print('[export] No previous cycle on disk - MoM sheet skipped (will be available after next calculation)')
-    except Exception as _prev_exc:
-        print(f'[export] Could not load previous cycle: {_prev_exc}')
-
-    current_engine.to_excel_with_values(
-        str(export_path),
-        inventory_quality_engine=_iq_engine_export,
-        previous_cycle_df=_prev_df,
-    )
-
-    # Apply edit highlights and summary sheet if there are any edits
-    _apply_edit_highlights(str(export_path), current_engine)
-
-    return send_file(str(export_path), as_attachment=True)
-
-
-@app.route('/api/export_db', methods=['POST'])
-def export_db():
-    """Export planning results to a flat DB-ready Excel file via DatabaseExporter."""
-    _, current_engine = _get_active()
-    if current_engine is None:
-        return jsonify({'error': 'No calculations run'}), 400
-
-    try:
-        planning_df = current_engine.to_dataframe()
-        site = getattr(current_engine.data.config, 'site', 'NLX1')
-        initial_date = current_engine.data.config.initial_date
-
-        exporter = DatabaseExporter(planning_df, site, initial_date)
-        db_df = exporter.export_to_dataframe()
-
-        if db_df.empty:
-            return jsonify({'error': 'No data to export (no matching line types)'}), 400
-
-        export_dir = APP_EXPORTS_DIR
-        export_dir.mkdir(exist_ok=True)
-
-        # Allow caller to override filename via JSON body
-        req_data = request.get_json(silent=True) or {}
-        filename = req_data.get('filename', '').strip()
-        if not filename:
-            filename = f'SOP_DB_Export_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
-        # Sanitise â€” keep only safe characters
-        safe_name = ''.join(c for c in filename if c.isalnum() or c in '._- ')
-        if not safe_name.endswith('.xlsx'):
-            safe_name += '.xlsx'
-
-        export_path = export_dir / safe_name
-        db_df.to_excel(str(export_path), index=False)
-        print(f'[export_db] {len(db_df)} rows written -> {export_path}')
-
-        return send_file(str(export_path), as_attachment=True, download_name=safe_name)
-    except Exception as e:
-        import traceback
-        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
-
-
-@app.route('/api/mom')
-def get_mom_comparison():
-    """Return sequential period-over-period MoM comparison from the current run."""
-    _, current_engine = _get_active()
-    if current_engine is None:
-        return jsonify({'available': False, 'message': 'No calculations run yet. Run calculations first.'})
-
-    try:
-        num_months = int(request.args.get('num_months', 6))
-        num_months = max(1, min(num_months, 24))
-
-        current_df = current_engine.to_dataframe()
-        result = MoMComparisonEngine.calculate_sequential(current_df, num_months)
-        return jsonify(result)
-    except Exception as e:
-        import traceback
-        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
 
 
 def _apply_edit_highlights(path: str, engine):
