@@ -36,6 +36,7 @@ from ui.replay import (
     replay_pending_edits,
 )
 from ui.routes.config import create_config_blueprint
+from ui.routes.edit_state import create_edit_state_blueprint
 from ui.routes.exports import create_exports_blueprint
 from ui.routes.license import create_license_blueprint
 from ui.routes.machines import create_machines_blueprint
@@ -326,6 +327,11 @@ app.register_blueprint(create_exports_blueprint(
     lambda: APP_EXPORTS_DIR,
     lambda: _cycle_manager,
     lambda path, engine: _apply_edit_highlights(path, engine),
+))
+app.register_blueprint(create_edit_state_blueprint(
+    sessions,
+    EDITABLE_LINE_TYPES,
+    _save_sessions_to_disk,
 ))
 
 
@@ -901,51 +907,6 @@ def _apply_edit_highlights(path: str, engine):
                          edit['period'], edit['original'], edit['new'], edit['delta_pct']])
 
     wb.save(path)
-
-
-@app.route('/api/editable_line_types')
-def get_editable_line_types():
-    return jsonify({'editable': sorted(EDITABLE_LINE_TYPES)})
-
-
-@app.route('/api/sessions/edits/persist', methods=['POST'])
-def persist_session_edit():
-    """Save a single cell edit into the session's persistent pending_edits store."""
-    req = request.get_json() or {}
-    session_id = req.get('session_id', '')
-    if not session_id or session_id not in sessions:
-        return jsonify({'error': 'Session not found'}), 404
-    key = req.get('key', '').strip()
-    if not key:
-        return jsonify({'error': 'Cell key required'}), 400
-    original = float(req.get('original', 0))
-    new_value = float(req.get('new_value', 0))
-    pending = sessions[session_id].setdefault('pending_edits', {})
-    if abs(new_value - original) < 0.0001:
-        pending.pop(key, None)   # edit reverted to original â€” remove entry
-    else:
-        pending[key] = {'original': original, 'new_value': new_value}
-    _save_sessions_to_disk()
-    return jsonify({'success': True})
-
-
-@app.route('/api/sessions/edits/sync', methods=['POST'])
-def sync_session_edits():
-    """Replace the entire pending_edits store for a session (used after undo/redo/reset/import)."""
-    req = request.get_json() or {}
-    session_id = req.get('session_id', '')
-    if not session_id or session_id not in sessions:
-        return jsonify({'error': 'Session not found'}), 404
-    edits = req.get('edits', {})
-    if not isinstance(edits, dict):
-        return jsonify({'error': 'edits must be an object'}), 400
-    sessions[session_id]['pending_edits'] = {
-        k: {'original': float(v.get('original', 0)), 'new_value': float(v.get('new_value', 0))}
-        for k, v in edits.items()
-        if isinstance(v, dict)
-    }
-    _save_sessions_to_disk()
-    return jsonify({'success': True})
 
 
 @app.route('/api/update_volume', methods=['POST'])
