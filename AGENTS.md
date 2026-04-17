@@ -1,247 +1,412 @@
-# AGENTS.md — Apex Rainier Planning Tool
+# AGENTS.md — UI Refactor
 
-**Read this before touching any code.** This is the Codex project instruction
-file. If you're about to modify code, confirm you understand the contracts and
-the state model below. When in doubt, ask — don't guess.
-
----
-
-## What this is
-
-Apex Rainier is an S&OP (Sales & Operations Planning) tool built by Apex
-Strategies and deployed at a **mining-industry client**. It consumes SAP-style
-monthly Excel workbooks (MS_RECONC `.xlsm`), runs a full demand →
-production/purchase → capacity → FTE pipeline, and emits a planning workbook,
-an optional month-over-month delta, and an optional flat DB export.
-
-Two entry points, same engines:
-- **Web UI** (`ui/app.py`, Flask, port 5000) — the primary way consultants and
-  client users interact with the tool. Supports multiple concurrent
-  **planning sessions** ("instances") with persistent state.
-- **CLI** (`main.py --cli`) — single-shot runs for scripted / batch use.
-
-Stakes: this is production client software, not a prototype. Correctness of
-numbers and stability across restarts matters more than elegance.
+**Scope of this file:** governs the ongoing stepwise split of `ui/app.py`
+into smaller route blueprints and helper modules. Goal: improve readability
+without changing calculation logic, contracts, or session behavior. For
+general project context, read `CLAUDE.md` first. In particular, the six
+sync/rebuild points defined there remain authoritative for anything that
+touches session, config, or engine state.
 
 ---
 
-## Architecture
+## Rules — read first, follow always
+
+### Scope discipline
+
+- Work on ONE route group or ONE helper function at a time.
+- ONE change = ONE commit. No batching, no squashing "while you're at it."
+- Do NOT modify function bodies when moving them. Copy byte-for-byte. If a
+  body needs changes to work in the new location (missing imports,
+  unreachable globals), make the minimum change required — do not "clean
+  up," "improve," or "modernize" logic.
+- Do NOT rename functions during a move. Renames are a separate task.
+- Do NOT touch functions not listed in the group you are working on.
+- Preserve endpoint paths, HTTP methods, and response shapes exactly.
+
+### Do-not-touch list for this refactor
+
+These functions contain cascade / calculation logic and are out of scope
+for structural moves. They stay where they are unless a dedicated task
+says otherwise:
+
+- `_recalc_one_material`
+- `_recalculate_value_results`
+- `_recalculate_capacity_and_values`
+- `_apply_volume_change` — see "Stop and ask" below
+- Anything inside `modules/` (engines are not touched by the UI refactor)
+
+### Stop and ask — do not proceed
+
+Stop and report to the user if any of these are true:
+
+- The move requires a circular import (e.g., module A imports from B which
+  imports from A). Describe the cycle; do not try to break it yourself.
+- The move requires changing a function signature that has more than two
+  call sites. List every caller first; wait for approval.
+- A test fails after your change. Do not "fix forward" — revert the commit
+  and describe what failed.
+- You discover a bug in a function you are moving. Do NOT fix it as part
+  of the move. Log it in `docs/observations.md`, commit the move as-is,
+  and flag it in your reply.
+- `_apply_volume_change` turns out to pull in more than two other
+  functions when extracted. Stop, describe the dependency graph, wait for
+  guidance.
+- Anything surprises you. Surprise is information; honor it.
+
+### Commit protocol
+
+Format: conventional commits.
 
 ```
-main.py
-├── run_cli()                         single-shot path
-│   └── PlanningEngine(xlsx).run()    orchestrator
-│        ├── DataLoader               parse MS_RECONC workbook
-│        ├── ForecastEngine           Line 01
-│        ├── BOMEngine                level ordering, dependent demand
-│        ├── InventoryEngine          Lines 03–06 (demand, stock, plans)
-│        ├── CapacityEngine           Lines 07–12 (utilization, FTE)
-│        ├── InventoryQualityEngine   QC overlay (optional)
-│        └── ValuePlanningEngine      €/cost overlay (optional)
-│
-└── run_web() → ui/app.py (Flask)     session-based interactive path
-     ├── sessions (module-level)      all planning "instances"
-     ├── _global_config               shared config mirror
-     └── per-session engine + edits   live state
+refactor(ui): extract <thing> to ui/<module>.py
+
+<one-line description of what moved and why the change is safe>
 ```
 
-Engine data flow is **strictly level-by-level in BOM topological order**.
-Parent-level production plans become child-level dependent demand. Breaking
-this order does not raise — it silently produces wrong numbers.
+Between commits: run all verification steps below. If any fails, do NOT
+commit. Report the failure and wait.
 
----
+### Verification after every change
 
-## ⚠️ Shared contracts — DO NOT BREAK
+1. `python -m py_compile` on every modified file.
+2. `python main.py --test` must pass.
+3. `pytest -v` must pass (the golden test stays green).
+4. For route-moving commits: confirm the route map still contains the same
+   endpoints with the same methods.
 
-### `PlanningRow` (the universal output unit, `modules/models.py`)
-Every engine emits `PlanningRow` instances. Downstream code assumes:
-- `material_number`, `line_type` — always populated, used as join keys
-- `values: Dict[str, float]` — keyed by period string `"YYYY-MM"`, never None
-- `aux_column`, `aux_2_column` — optional display fields; consumers must
-  handle None
-- `starting_stock` — only meaningful for Line 04 (inventory)
-- Identifier columns (`product_family`, `spc_product`, `product_cluster`,
-  `product_name`) are copied from `Material`; changing population affects
-  Excel grouping and MoM joins
+### State discipline (from CLAUDE.md, repeated because it matters)
 
-### `LineType` (the canonical rows, `modules/models.py`)
-Enum with string values like `"01. Demand forecast"`.
-`PlanningEngine.EXPECTED_LINE_TYPES` asserts the full list. Never rename,
-reorder, or add line types without:
-1. Updating `LineType` enum AND `EXPECTED_LINE_TYPES`
-2. Updating every engine that produces that line
-3. Updating every engine that consumes it (esp. `CapacityEngine`,
-   `MoMComparisonEngine`, `ValuePlanningEngine`)
-4. Updating Excel export logic in `planning_engine.to_excel_with_values`
-5. Updating the web-UI cascade: an edit to a line must propagate through
-   every dependent line correctly (see State Model below)
-6. Updating `run_test()` assertion count
+When a move touches session / config / engine state, explicitly answer:
 
-### Period format
-All period keys are `"YYYY-MM"` strings generated by
-`PlanningConfig.get_periods()`. Never mix in `datetime`. Sorting is
-lexicographic and relies on this format.
-
-### `Material`, `BOMItem`, `Machine`, `MachineGroup`
-Domain types. `Material.product_type_raw` carries VBA-era semantics — it can
-hold a line-type string for truck/control-room materials used by
-`TruckOperationsFormulas`. Don't "clean this up" without understanding the
-consumers.
-
----
-
-## ⚠️ The state model (this is where most bugs come from)
-
-`ui/app.py` holds state in **three coupled layers**:
-
-| Layer | What's there | Lifetime |
-|---|---|---|
-| Module globals | `sessions`, `active_session_id`, `_global_config` | Process |
-| Per-session dict | `reset_baseline`, `pending_edits`, `value_aux_overrides`, `machine_overrides`, `valuation_params`, `parameters` | Persisted to `sessions_store.json` (engine NOT persisted) |
-| Live engine | `engine.results`, `engine.value_results`, `engine.data` | Per-session, rebuilt on restart |
-
-These are kept consistent by **six sync/rebuild points**. Every new piece of
-state must participate in all six. This is the single most common source of
-cross-cutting bugs:
-
-1. **`_sync_global_config_from_engine(engine)`** — when a session becomes
-   active, pull its state into `_global_config` so subsequent reads/writes
-   target the right instance. **Any config field added must be copied here,
-   or switching instances will show stale values from the previous session.**
-2. **`_get_session_config_overrides(sess)`** — when rebuilding an engine for
-   a session, push session-specific state back into engine construction.
-   **If a new config field is missing here, rebuilds (after restart or
-   parameter change) silently revert to defaults.**
-3. **`_ensure_reset_baseline(sess, engine)` / `_snapshot_engine_state`** —
-   capture the snapshot that "Reset" restores to. **If new state isn't
-   captured, Reset appears to work but leaves the new state untouched.**
-4. **`_replay_pending_edits(sess, engine)`** — after a rebuild (restart,
-   parameter change, reset), replay saved edits so the engine reaches the
-   same final state. **Replay order matters for combined edits: if the user
-   edited Line 01 then Line 06, replaying in the wrong order yields a
-   different result. Preserve insertion order.**
-5. **`_recalculate_value_results(engine, sess)` and
-   `_recalculate_capacity_and_values(engine, sess)`** — re-run downstream
-   engines after any upstream change. **A line-type edit that doesn't
-   trigger the right recalc leaves the UI with tables saying one thing and
-   graphs showing another.**
-6. **`_save_sessions_to_disk()` / `_load_sessions_from_disk()`** — JSON
-   persistence for session metadata. **New session fields must be
-   serializable and handled by both save and load, or they vanish on
-   restart.**
-
-### Rule for agents when adding or changing state
-
-Before you finish any change that adds a new field to sessions,
-`_global_config`, or engine state, **answer these explicitly in your reply**:
 - Is it snapshotted in `_ensure_reset_baseline`?
-- Is it copied by `_sync_global_config_from_engine`?
-- Is it applied by `_get_session_config_overrides`?
-- Is it replayed / recomputed after rebuild?
-- Does it trigger the correct recalc on change (and only that one)?
-- Is it serialized in `_save_sessions_to_disk` and restored in
+- Is it copied by `_sync_global_config_from_engine` on session switch?
+- Is it applied by `_get_session_config_overrides` on rebuild?
+- Is it replayed or recomputed after rebuild?
+- Does it trigger the correct downstream recalculation?
+- Is it serialized in `_save_sessions_to_disk` and restored by
   `_load_sessions_from_disk`?
 
-If any answer is "no" or "not sure", stop and ask.
+If any answer is "no" or "not sure," stop.
+
+### Required report at end of each change
+
+Every reply that includes a commit must state:
+
+1. **What moved:** function or route and its new module.
+2. **Signature change:** before → after, or "none."
+3. **Call sites updated:** files and line numbers touched.
+4. **Globals touched:** which of `sessions`, `active_session_id`,
+   `_global_config` the code reads or writes, and how the new module
+   accesses them (parameter, import, or other).
+5. **Verification results:** `py_compile`, `main.py --test`, `pytest`.
+6. **Unexpected decisions:** anything you decided without explicit
+   guidance. Flag these so the user can veto.
+
+If you cannot produce this report honestly, say so. Do not fabricate.
+
+### Out of scope for this refactor
+
+Do not do any of the following, even if asked in the middle of an
+extraction:
+
+- Adding new tests.
+- Improving any existing function's logic.
+- Renaming variables or functions.
+- Updating docstrings beyond relocating them.
+- Adding or removing type hints.
+- Reorganizing internal structure of target modules.
+- Refactoring engine code under `modules/`.
+
+If the user requests any of these mid-task, complete the current
+extraction, commit, then start a separate task.
 
 ---
 
-## Line-type cascade invariant
+## Current state of the refactor
 
-Edits cascade through BOM topological order. Concretely, an edit to
-Line 01 (demand forecast) for material X must trigger recomputation of:
-- Line 02/03 for X
-- Lines 04–06 for X (if applicable)
-- Line 08 for parents of X (dependent requirements)
-- Lines 07/09–12 for any machine group X flows through
+### Already moved
 
-Combinations are where bugs hide: edit A followed by edit B must produce the
-same result whether A and B were applied live in sequence or replayed from
-`pending_edits` after a restart. The replay path is the source of truth — if
-live behavior diverges from replay, **the live behavior is wrong** (because
-replay is what persists across restarts).
+- License routes → `ui/routes/license.py`
+- Config / folder routes → `ui/routes/config.py`
+- Read-only result routes → `ui/routes/read.py`
+- Machine routes → `ui/routes/machines.py`
+- PAP routes → `ui/routes/pap.py`
 
----
+### Still in `ui/app.py`
 
-## Change protocol
+- Start / upload / calculate routes
+- Export / MoM routes
+- Edit routes
+- Scenario routes
+- Session routes
+- Seven helper functions (see below)
 
-1. **Before changing an engine's output**, grep for its `LineType` value and
-   any modified field across `modules/` and `ui/app.py`. List every consumer
-   in your plan before writing code.
-2. **Before changing `models.py`**, list every file that imports the affected
-   class. Prefer additive changes (new optional field with default) over
-   renames or removals.
-3. **When adding new session / config state**, walk the six sync points
-   above. Missing one is the failure mode, not the exception.
-4. **Never silently change numeric formulas.** If you spot what looks like a
-   bug, describe it and ask before fixing.
-5. **Refactoring `planning_engine.py` or `ui/app.py` is welcome** if it
-   genuinely simplifies the state model or the cascade — but (a) do it in a
-   dedicated branch with no feature work mixed in, (b) keep `--test` green
-   at every commit, and (c) describe the before/after architecture in the PR.
+### Helper extraction (parallel track)
 
----
+Seven helper functions currently defined in `ui/app.py` need to move to
+the sibling modules that already exist. This can happen before, during,
+or after the route moves — in its own commits.
 
-## Known failure modes (quick reference)
+| Function                          | Target module            |
+|-----------------------------------|--------------------------|
+| `_snapshot_engine_state`          | `ui/state_snapshot.py`   |
+| `_ensure_reset_baseline`          | `ui/state_snapshot.py`   |
+| `_sync_global_config_from_engine` | `ui/config_store.py`     |
+| `_get_session_config_overrides`   | `ui/config_store.py`     |
+| `_build_clean_engine_for_session` | `ui/engine_rebuild.py`   |
+| `_replay_pending_edits`           | `ui/replay.py`           |
+| `_apply_volume_change`            | see "Stop and ask"       |
 
-Map symptoms to the underlying mechanism:
+Prefer parameter passing over cross-module imports when a helper
+references `sessions`, `active_session_id`, or `_global_config`. If
+parameter passing is impractical, import explicitly and flag it in your
+report.
 
-- **"Reset doesn't fully reset"** → field missing from `_snapshot_engine_state`.
-- **"Switching instances shows wrong values"** → field missing from
-  `_sync_global_config_from_engine` or cross-contamination via
-  `_global_config` fallback in `_get_session_config_overrides`.
-- **"Config change doesn't stick after restart"** → not serialized in
-  `_save_sessions_to_disk`, or not applied in `_get_session_config_overrides`.
-- **"Edits feel slow"** → recalc scope too broad; look at which
-  `_recalculate_*` is triggered and whether the scope can be narrower.
-- **"Graphs disagree with the table"** → edit path updated tables but not
-  the downstream recalc that graphs read from.
-- **"Combination of edits produces unexpected result"** → replay order in
-  `_replay_pending_edits`, or a cascade step that depends on state set by
-  a sibling edit that hadn't replayed yet.
-- **"Something broke after restart that worked before"** → almost always a
-  persistence gap: state was live-only, not in `sessions_store.json`.
+Never duplicate global state across modules.
 
 ---
 
-## Conventions
+## Route group reference
 
-- **Language:** Code, identifiers, comments in English. User-facing web UI
-  copy may be Dutch; preserve existing copy unless asked.
-- **Runtime data:** `%LOCALAPPDATA%\SOPPlanningEngine` by default. Respect
-  `SOP_APP_DATA_DIR`. Never write runtime files into the repo.
-- **Repo hygiene:** `uploads/`, `exports/`, `imports/`, `sessions/`, any
-  `*.xlsm` / `*.xlsx` are gitignored. Never commit client data.
-- **Python style:** dataclasses for data, explicit type hints on public
-  engine methods, `pathlib.Path` over `os.path`. Follow existing patterns
-  in `planning_engine.py`.
-- **Imports:** `from modules.x import Y`. `main.py`'s `sys.path.insert`
-  makes this work from the repo root.
+Use this section when working on a specific group. The state / risk /
+helpers lists describe what must be preserved.
+
+### Sessions
+
+**Routes**
+- `POST /api/sessions/snapshot`
+- `GET /api/sessions`
+- `POST /api/sessions/rename`
+- `POST /api/sessions/switch`
+- `DELETE /api/sessions/<session_id>`
+
+**State touched**
+- `sessions`
+- `active_session_id`
+- `_global_config`
+- per-session `engine`
+- `reset_baseline`
+- `pending_edits`
+- `machine_overrides`
+- `value_aux_overrides`
+- `valuation_params`
+- `parameters`
+
+**Risks**
+- Wrong active session after switch/delete.
+- `_global_config` shows values from previous instance.
+- Rebuild after restart misses session-specific config.
+- Pending edits are not replayed.
+- Reset baseline belongs to the wrong engine.
+
+**Helpers / contracts to preserve**
+- `_sync_global_config_from_engine`
+- `_get_session_config_overrides`
+- `_build_clean_engine_for_session`
+- `_install_clean_engine_baseline`
+- `_replay_pending_edits`
+- `_save_sessions_to_disk`
+- `_load_sessions_from_disk`
+- `_ensure_reset_baseline`
+
+**Minimal verification**
+- Route map contains the same session endpoints.
+- Create and snapshot a new session.
+- Switch between sessions both directions.
+- Rename and delete.
+- `python main.py --test` passes.
+
+### Scenarios
+
+**Routes**
+- `GET /api/scenarios`
+- `POST /api/scenarios/save`
+- `POST /api/scenarios/load`
+- `DELETE /api/scenarios/<scenario_id>`
+- `POST /api/scenarios/compare`
+- `GET /api/scenarios/compare/export`
+
+**State touched**
+- `scenarios`
+- `sessions[active_session_id]`
+- `engine.results`
+- `engine.value_results`
+- `pending_edits`
+- `value_aux_overrides`
+- `machine_overrides`
+- `purchased_and_produced`
+
+**Risks**
+- Scenario load restores tables but not all derived chart data.
+- Pending edits snapshot diverges from live / replay behavior.
+- PAP or machine overrides make it into the scenario but not into
+  rebuild.
+- Compare / export uses stale or wrong scenario selection.
+
+**Helpers / contracts to preserve**
+- `_snapshot_engine_state`
+- `restore_engine_state`
+- `_build_pending_edits_from_results_snapshot`
+- `_planning_value_payload`
+- `_moq_warnings_payload`
+- `_parse_purchased_and_produced`
+- `_format_purchased_and_produced`
+
+**Minimal verification**
+- Save, load, and delete a scenario.
+- Compare two scenarios.
+- Call scenario compare export.
+- After scenario load: table, dashboard, and value results agree.
+- `python main.py --test` passes.
+
+### Edits
+
+**Routes**
+- `GET /api/editable_line_types`
+- `POST /api/sessions/edits/persist`
+- `POST /api/sessions/edits/sync`
+- `POST /api/update_volume`
+- `POST /api/update_value_aux`
+- `POST /api/reset_value_planning_edits`
+- `POST /api/undo`
+- `POST /api/redo`
+- `GET /api/edits/export`
+- `POST /api/edits/import`
+- `POST /api/reset_edits`
+
+**State touched**
+- `engine.results`
+- `engine.value_results`
+- `pending_edits`
+- `value_aux_overrides`
+- `reset_baseline`
+- `undo_stack`
+- `redo_stack`
+- Downstream machine / capacity / value results.
+
+**Risks**
+- Live edit and replay edit produce different results. Per CLAUDE.md,
+  replay is the source of truth; if they disagree, live is wrong.
+- Line 01 / Line 06 edit cascade misses dependent demand, inventory, or
+  capacity.
+- Undo / redo updates the table but not value results or charts.
+- Import / export of edits changes order or overwrites the original
+  baseline.
+- Reset appears to work but leaves a new state field untouched.
+
+**Helpers / contracts to preserve**
+- `_apply_volume_change`
+- `_recalc_one_material`
+- `_recalculate_value_results`
+- `_recalculate_capacity_and_values`
+- `_replay_pending_edits`
+- `_ensure_reset_baseline`
+- `_planning_value_payload`
+- `_value_results_payload`
+
+**Minimal verification**
+- Edit Line 01; check downstream volume, capacity, value.
+- Edit Line 06; check inventory, capacity, value.
+- Undo, redo, reset.
+- Export and import edits.
+- Simulate restart / rebuild path with pending edits.
+- `python main.py --test` passes.
+
+### Exports and MoM
+
+**Routes**
+- `GET /api/export`
+- `POST /api/export_db`
+- `GET /api/mom`
+
+**State touched**
+- `engine.results`
+- `engine.value_results`
+- `_cycle_manager`
+- `APP_EXPORTS_DIR`
+- Optional DB export payload.
+
+**Risks**
+- Runtime files written into the repo instead of the app-data directory.
+- Export uses stale active session.
+- MoM snapshot or compare uses wrong cycle folder.
+- Export missing value planning or consolidation rows.
+
+**Helpers / contracts to preserve**
+- `PlanningEngine.to_excel_with_values`
+- `DatabaseExporter`
+- `MoMComparisonEngine`
+- `_cycle_manager`
+- `_json_safe`
+
+**Minimal verification**
+- Download a planning export.
+- Run a DB export.
+- Call the MoM endpoint.
+- Output lands in the correct exports folder.
+- `python main.py --test` passes.
+
+### Start, upload, and calculate
+
+**Routes**
+- `GET /`
+- `POST /api/upload`
+- `POST /api/calculate`
+
+**State touched**
+- `sessions`
+- `active_session_id`
+- `_global_config`
+- Uploaded workbook path.
+- Per-session engine.
+- Reset baseline.
+- Runtime folders.
+
+**Risks**
+- New upload overwrites the wrong session.
+- Calculate builds the engine from global config instead of session
+  config.
+- Error classification for upload / calculate becomes less precise.
+- Initial baseline is snapshotted too early or too late.
+
+**Helpers / contracts to preserve**
+- `_classify_upload_exception`
+- `_get_session_config_overrides`
+- `_sync_global_config_from_engine`
+- `_ensure_reset_baseline`
+- `_save_sessions_to_disk`
+- `_moq_warnings_payload`
+
+**Minimal verification**
+- Web app opens.
+- Upload a workbook.
+- Calculate.
+- A new session appears and is active.
+- `python main.py --test` passes.
 
 ---
 
-## Commands
+## Per-step checklist
 
-```powershell
-pip install -r requirements.txt
+For every route move:
 
-python main.py                                                      # web UI
-python main.py --cli path/to/MS_RECONC.xlsm --planning-month 2025-12 --months-actuals 11
-python main.py --test                                               # smoke
-python main.py --cli path/to/file.xlsm --export-db                  # + DB export
-```
+- Move the route handlers to `ui/routes/<group>.py`.
+- Inject dependencies through `create_<group>_blueprint(...)`.
+- Leave numeric / cascade helpers in place.
+- Preserve endpoint paths, methods, and response shapes.
+- Confirm the route map.
+- Run `python -m py_compile` on every modified module.
+- Run `python main.py --test`.
+- Run `pytest -v`.
+- Commit as a separate small step.
+- Produce the end-of-task report described above.
 
-Env flags: `SOP_HOST`, `SOP_PORT`, `SOP_NO_BROWSER`, `SOP_NO_BANNER`,
-`SOP_APP_DATA_DIR`, `SOP_TEST_FILE`.
+For every helper extraction:
 
----
-
-## When you (the agent) finish a change
-
-Confirm in your reply:
-1. Which engines/files you modified.
-2. Which contracts (`PlanningRow`, `LineType`, etc.) your change touches.
-3. Which of the six state-sync points your change participates in.
-4. Which downstream consumers you verified still work.
-5. Whether `python main.py --test` still passes (or why it can't be run).
-6. Anything you decided for yourself — flag it so the user can veto.
+- Copy the function body byte-for-byte to the target module.
+- Replace the original in `ui/app.py` with an import.
+- Update call sites if the signature changed (prefer parameter passing).
+- Confirm no circular import was introduced.
+- Run `python -m py_compile`, `python main.py --test`, and `pytest -v`.
+- Commit as a separate small step.
+- Produce the end-of-task report.
