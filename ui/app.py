@@ -1,4 +1,4 @@
-"""S&OP Planning Engine - Flask Web UI"""
+﻿"""S&OP Planning Engine - Flask Web UI"""
 
 from flask import Flask, render_template, request, jsonify, send_file
 import pandas as pd
@@ -25,6 +25,12 @@ from ui.serializers import (
     row_payload as _row_payload,
     value_results_payload as _value_results_payload,
 )
+from ui.engine_rebuild import (
+    build_clean_engine_for_session,
+    get_config_overrides,
+    get_session_config_overrides,
+    install_clean_engine_baseline,
+)
 from ui.session_store import (
     load_sessions_from_disk,
     save_sessions_to_disk,
@@ -47,7 +53,7 @@ RESOURCE_ROOT = resource_root()
 APP_DATA_ROOT = default_app_data_root()
 APP_DATA_ROOT.mkdir(parents=True, exist_ok=True)
 
-# Default folder paths — overridden by _apply_folder_config() after config loads
+# Default folder paths â€” overridden by _apply_folder_config() after config loads
 APP_UPLOADS_DIR = APP_DATA_ROOT / 'uploads'
 APP_EXPORTS_DIR = APP_DATA_ROOT / 'exports'
 APP_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
@@ -92,7 +98,7 @@ def _classify_upload_exception(exc: Exception, stage: str) -> dict:
         msg = f'Geen toegang tot bestand tijdens {stage}: {raw}'
         kind = 'permission'
     elif isinstance(exc, OSError) and 'No space' in raw:
-        msg = 'Schijf vol — kan upload niet opslaan.'
+        msg = 'Schijf vol â€” kan upload niet opslaan.'
         kind = 'disk_full'
     elif isinstance(exc, MemoryError):
         msg = f'Onvoldoende geheugen tijdens {stage}.'
@@ -122,7 +128,7 @@ sessions: dict = {}           # session_id -> session dict
 active_session_id: str = None  # currently selected session
 scenarios: dict = {}          # scenario_id -> scenario snapshot
 
-# Shared CycleManager — stores previous-cycle snapshots in the writable app-data exports folder
+# Shared CycleManager â€” stores previous-cycle snapshots in the writable app-data exports folder
 _CYCLE_STORAGE_DIR = APP_EXPORTS_DIR
 _cycle_manager = CycleManager(str(_CYCLE_STORAGE_DIR))
 
@@ -189,64 +195,20 @@ def _ensure_reset_baseline(sess, engine) -> None:
 
 
 def _get_session_config_overrides(sess=None) -> dict:
-    """Build config_overrides for an engine rebuild, using session-specific
-    valuation_params and purchased_and_produced so different sessions don't
-    contaminate each other.
-    Priority: live engine.data (most up-to-date) → persisted per-session params
-    (correct after restart) → shared _global_config (fallback)."""
-    ov = _get_config_overrides()
-    if sess is None:
-        return ov
-    engine_data = getattr(sess.get('engine'), 'data', None)
-    # Live engine is the most accurate source — params updated in-place by configure/reset
-    vp_obj = getattr(engine_data, 'valuation_params', None)
-    if vp_obj is not None:
-        ov['valuation_params'] = {
-            '1': vp_obj.direct_fte_cost_per_month,
-            '2': vp_obj.indirect_fte_cost_per_month,
-            '3': vp_obj.overhead_cost_per_month,
-            '4': vp_obj.sga_cost_per_month,
-            '5': vp_obj.depreciation_per_year,
-            '6': vp_obj.net_book_value,
-            '7': vp_obj.days_sales_outstanding,
-            '8': vp_obj.days_payable_outstanding,
-        }
-    elif sess.get('valuation_params'):
-        # Per-session params persisted to disk and loaded on restart
-        ov['valuation_params'] = sess['valuation_params']
-    # Override PAP from the session's own engine so rebuilds/autorun don't pick
-    # up another session's purchased_and_produced from _global_config.
-    pap = getattr(engine_data, 'purchased_and_produced', None)
-    if pap is not None:
-        ov['purchased_and_produced'] = _format_purchased_and_produced(pap)
-    return ov
+    return get_session_config_overrides(sess, _global_config)
 
 
 def _build_clean_engine_for_session(sess, params=None):
-    params = params or sess.get('parameters') or {}
-    if not params:
-        return None
-    months_forecast = int(params.get('months_forecast', 12) or 12)
-    if _global_config.get('forecast_months'):
-        months_forecast = int(_global_config.get('forecast_months') or months_forecast)
-    engine = PlanningEngine(
-        sess['file_path'],
-        planning_month=params.get('planning_month'),
-        months_actuals=int(params.get('months_actuals', 0) or 0),
-        months_forecast=months_forecast,
-        extract_files=sess.get('extract_files'),
-        config_overrides=_get_session_config_overrides(sess),
-    )
-    engine.run()
-    return engine
+    return build_clean_engine_for_session(sess, _global_config, params)
 
 
 def _install_clean_engine_baseline(sess, engine, clear_machine_overrides: bool = True) -> None:
-    sess['reset_baseline'] = _snapshot_engine_state(engine)
-    # A fresh calculate invalidates stale machine undo history
-    sess['machine_undo'] = []
-    if clear_machine_overrides:
-        sess['machine_overrides'] = {}
+    install_clean_engine_baseline(
+        sess,
+        engine,
+        _snapshot_engine_state,
+        clear_machine_overrides=clear_machine_overrides,
+    )
 
 
 def _load_global_config():
@@ -272,20 +234,7 @@ def _save_global_config():
 
 
 def _get_config_overrides() -> dict:
-    """Build config_overrides dict from global config for use in PlanningEngine."""
-    ov = {}
-    if _global_config.get('site'):
-        ov['site'] = _global_config['site']
-    if _global_config.get('forecast_months'):
-        ov['forecast_months'] = int(_global_config['forecast_months'])
-    if _global_config.get('unlimited_machines'):
-        ov['unlimited_machines'] = _global_config['unlimited_machines']
-    if _global_config.get('purchased_and_produced'):
-        ov['purchased_and_produced'] = _global_config['purchased_and_produced']
-    vp = _global_config.get('valuation_params')
-    if vp and any(float(v or 0) != 0 for v in vp.values()):
-        ov['valuation_params'] = vp
-    return ov
+    return get_config_overrides(_global_config)
 
 
 def _save_sessions_to_disk():
@@ -766,7 +715,7 @@ def reset_vp_params_to_defaults():
 
     baseline_vp = (sess.get('reset_baseline') or {}).get('valuation_params')
     if not baseline_vp:
-        return jsonify({'error': 'No baseline available — run calculations first'}), 400
+        return jsonify({'error': 'No baseline available â€” run calculations first'}), 400
 
     current_engine.data.valuation_params = _valuation_params_from_config(baseline_vp)
     _global_config['valuation_params'] = {str(k): float(v) for k, v in baseline_vp.items()}
@@ -1224,29 +1173,29 @@ def get_value_results():
 
 @app.route('/api/dashboard')
 def get_dashboard():
-    """Aggregated dashboard endpoint — single call returns all KPIs + chart data."""
+    """Aggregated dashboard endpoint â€” single call returns all KPIs + chart data."""
     _, current_engine = _get_active()
     if current_engine is None:
         return jsonify({'error': 'No calculations run'}), 400
 
     periods = current_engine.data.periods
 
-    # ── KPI: materials count ────────────────────────────────────────────────
+    # â”€â”€ KPI: materials count â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     materials_count = len(current_engine.data.materials)
 
-    # ── KPI: avg utilization from Line 10 ──────────────────────────────────
+    # â”€â”€ KPI: avg utilization from Line 10 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     util_rows = current_engine.results.get(LineType.UTILIZATION_RATE.value, [])
     all_util_vals = [v * 100 for row in util_rows for v in row.values.values() if v is not None]
     avg_utilization = round(sum(all_util_vals) / len(all_util_vals), 1) if all_util_vals else 0.0
 
-    # ── KPI: total FTE from Line 12, sum across all groups for latest period ─
+    # â”€â”€ KPI: total FTE from Line 12, sum across all groups for latest period â”€
     fte_rows = current_engine.results.get(LineType.FTE_REQUIREMENTS.value, [])
     latest_period = periods[-1] if periods else None
     total_fte = round(
         sum(row.values.get(latest_period, 0.0) for row in fte_rows), 2
     ) if latest_period else 0.0
 
-    # ── utilization_by_machine (Line 10 rows, values as %) ─────────────────
+    # â”€â”€ utilization_by_machine (Line 10 rows, values as %) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     utilization_by_machine = []
     for row in util_rows:
         utilization_by_machine.append({
@@ -1255,7 +1204,7 @@ def get_dashboard():
             'values': {p: round(v * 100, 1) for p, v in row.values.items()},
         })
 
-    # ── fte_by_group (Line 12 rows) ─────────────────────────────────────────
+    # â”€â”€ fte_by_group (Line 12 rows) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     fte_by_group = []
     for row in fte_rows:
         fte_by_group.append({
@@ -1263,17 +1212,17 @@ def get_dashboard():
             'values': {p: round(v, 2) for p, v in row.values.items()},
         })
 
-    # ── financials from consolidation rows ──────────────────────────────────
+    # â”€â”€ financials from consolidation rows â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     financials = {}
     for row in current_engine.value_results.get(LineType.CONSOLIDATION.value, []):
         key = row.material_number.replace('ZZZZZZ_', '')
-        # ROCE is a ratio (e.g. 0.042 = 4.2%) — preserve precision so the
+        # ROCE is a ratio (e.g. 0.042 = 4.2%) â€” preserve precision so the
         # frontend can multiply by 100.  All other P&L rows are large EUR
         # amounts that round cleanly to 0 decimal places.
         decimals = 6 if key == 'ROCE' else 0
         financials[key] = {p: round(v, decimals) for p, v in row.values.items()}
 
-    # ── inventory quality — cached in engine, recomputed only after an edit ──
+    # â”€â”€ inventory quality â€” cached in engine, recomputed only after an edit â”€â”€
     inventory_quality: list = []
     top_10_overstocks: list = []
     total_overstock = 0.0
@@ -1939,7 +1888,7 @@ def export_db():
         filename = req_data.get('filename', '').strip()
         if not filename:
             filename = f'SOP_DB_Export_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
-        # Sanitise — keep only safe characters
+        # Sanitise â€” keep only safe characters
         safe_name = ''.join(c for c in filename if c.isalnum() or c in '._- ')
         if not safe_name.endswith('.xlsx'):
             safe_name += '.xlsx'
@@ -2085,7 +2034,7 @@ def persist_session_edit():
     new_value = float(req.get('new_value', 0))
     pending = sessions[session_id].setdefault('pending_edits', {})
     if abs(new_value - original) < 0.0001:
-        pending.pop(key, None)   # edit reverted to original — remove entry
+        pending.pop(key, None)   # edit reverted to original â€” remove entry
     else:
         pending[key] = {'original': original, 'new_value': new_value}
     _save_sessions_to_disk()
@@ -2435,7 +2384,7 @@ def _apply_volume_change(sess, current_engine, line_type, material_number, perio
             LineType.MIN_TARGET_STOCK.value, LineType.PRODUCTION_PLAN.value,
             LineType.PURCHASE_RECEIPT.value, LineType.PURCHASE_PLAN.value,
         ]
-        # Preserve manual_edits markers for L06/L07 across the rebuild — otherwise
+        # Preserve manual_edits markers for L06/L07 across the rebuild â€” otherwise
         # a subsequent edit would forget prior edited months and recompute them heuristically.
         prior_prod_edits = dict(prod_row.manual_edits) if prod_row and getattr(prod_row, 'manual_edits', None) else {}
         prior_purch_edits = dict(purch_row.manual_edits) if purch_row and getattr(purch_row, 'manual_edits', None) else {}
@@ -2759,7 +2708,7 @@ def _recalc_one_material(
     l05_saved_edits = dict(l05_row.manual_edits) if l05_row else {}
 
     # Preserve manually edited periods for production plan and purchase receipt so
-    # cascade recalculations (demand change, BOM cascade) honour sticky overrides —
+    # cascade recalculations (demand change, BOM cascade) honour sticky overrides â€”
     # identical to the direct-edit path in _apply_volume_change.
     prod_row_pre = next(
         (r for r in current_engine.results.get(LineType.PRODUCTION_PLAN.value, [])
@@ -2947,7 +2896,7 @@ def _recalculate_capacity_and_values(current_engine, sess):
 def _recalc_pap_material(current_engine, material_number):
     """Re-run inventory + full BOM cascade for a PAP material change.
     Uses BFS so every child (and grandchild, etc.) gets its inventory recalculated
-    after its dependent demand is updated — not just L02/L03."""
+    after its dependent demand is updated â€” not just L02/L03."""
     from modules.inventory_engine import InventoryEngine
     from modules.bom_engine import BOMEngine
 
@@ -3316,7 +3265,7 @@ def export_scenario_comparison():
     if sc_a['session_id'] != active_session_id or sc_b['session_id'] != active_session_id:
         return jsonify({'error': 'Scenarios belong to a different session'}), 403
 
-    # ── Reuse compare logic ─────────────────────────────────────────────────
+    # â”€â”€ Reuse compare logic â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def _build_diff_rows(res_a, res_b):
         rows = []
         for lt, rows_a in res_a.items():
@@ -3388,7 +3337,7 @@ def export_scenario_comparison():
                 cell.fill = ROW_B_FILL
             # Diff row
             total_diff = round(sum(dv.get(p, 0) for p in periods), 2)
-            diff_data  = [mat, name, lt, 'Diff (A−B)'] + [dv.get(p, 0) for p in periods] + [total_diff]
+            diff_data  = [mat, name, lt, 'Diff (Aâˆ’B)'] + [dv.get(p, 0) for p in periods] + [total_diff]
             ws.append(diff_data)
             diff_excel_row = ws.max_row
             period_start_col = 5  # columns 1-4 are fixed metadata
@@ -3592,7 +3541,7 @@ def switch_session():
                 _install_clean_engine_baseline(sess, sess['engine'], clear_machine_overrides=False)
         except Exception:
             pass
-    # Set active session only after all setup succeeds — avoids leaving a broken
+    # Set active session only after all setup succeeds â€” avoids leaving a broken
     # session active if the engine rebuild above raised an exception and returned early.
     active_session_id = sid
     _sync_global_config_from_engine(sess.get('engine'))
@@ -3664,3 +3613,4 @@ if __name__ == '__main__':
     host = os.getenv('SOP_HOST', '127.0.0.1')
     port = int(os.getenv('SOP_PORT', '5000'))
     app.run(debug=False, host=host, port=port)
+
