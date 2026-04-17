@@ -5942,10 +5942,14 @@ async function deletePapRow(mat) {
         const res = await fetch(`/api/pap/${encodeURIComponent(mat)}`, { method: 'DELETE' });
         const data = await res.json();
         await _applyPapResult(data);
-        const row = document.querySelector(`tr[data-pap-mat="${mat}"]`);
-        if (row) row.remove();
-        if (!document.querySelector('#papTbody tr[data-pap-mat]'))
-            document.getElementById('papTbody').innerHTML = '<tr><td colspan="3" class="text-center text-slate-500 p-4">No entries</td></tr>';
+        const tbody = document.getElementById('papTbody');
+        if (tbody) {
+            const row = tbody.querySelector(`tr[data-pap-mat="${mat}"]`);
+            if (row) row.remove();
+            if (!tbody.querySelector('tr[data-pap-mat]')) {
+                tbody.innerHTML = '<tr><td colspan="3" class="text-center text-slate-500 p-4">No entries</td></tr>';
+            }
+        }
         log(`PAP entry removed: ${mat}`);
     } catch (e) { alert('Error: ' + e); }
 }
