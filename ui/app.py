@@ -24,6 +24,10 @@ from ui.serializers import (
     row_payload as _row_payload,
     value_results_payload as _value_results_payload,
 )
+from ui.session_store import (
+    load_sessions_from_disk,
+    save_sessions_to_disk,
+)
 
 RESOURCE_ROOT = resource_root()
 APP_DATA_ROOT = default_app_data_root()
@@ -558,102 +562,20 @@ def _valuation_params_from_config(value) -> ValuationParameters:
 
 
 def _save_sessions_to_disk():
-    """Persist session metadata (no engine objects) to sessions_store.json."""
     try:
-        serializable = {}
-        for sid, sess in sessions.items():
-            # Persist current valuation_params per-session so rebuilds after
-            # restart use the correct per-session values, not the shared global config.
-            engine = sess.get('engine')
-            vp_obj = getattr(getattr(engine, 'data', None), 'valuation_params', None)
-            if vp_obj is not None:
-                sess_vp = {
-                    '1': vp_obj.direct_fte_cost_per_month,
-                    '2': vp_obj.indirect_fte_cost_per_month,
-                    '3': vp_obj.overhead_cost_per_month,
-                    '4': vp_obj.sga_cost_per_month,
-                    '5': vp_obj.depreciation_per_year,
-                    '6': vp_obj.net_book_value,
-                    '7': vp_obj.days_sales_outstanding,
-                    '8': vp_obj.days_payable_outstanding,
-                }
-            else:
-                sess_vp = (sess.get('reset_baseline') or {}).get('valuation_params') or sess.get('valuation_params')
-            serializable[sid] = {
-                'id':           sess.get('id', sid),
-                'file_path':    sess.get('file_path', ''),
-                'extract_files': sess.get('extract_files'),
-                'filename':     sess.get('filename', ''),
-                'custom_name':  sess.get('custom_name'),
-                'is_snapshot':  sess.get('is_snapshot', False),
-                'metadata':     sess.get('metadata', {}),
-                'uploaded_at':  sess.get('uploaded_at', ''),
-                'parameters':   sess.get('parameters'),
-                'pending_edits': sess.get('pending_edits', {}),
-                'value_aux_overrides': sess.get('value_aux_overrides', {}),
-                'machine_overrides': _machine_overrides_from_engine(sess, engine) if engine is not None else sess.get('machine_overrides', {}),
-                'valuation_params': sess_vp,
-            }
-        store = {
-            'active_session_id': active_session_id,
-            'sessions':          serializable,
-        }
-        tmp_path = SESSIONS_STORE.with_name(f'{SESSIONS_STORE.name}.tmp')
-        with open(tmp_path, 'w', encoding='utf-8') as f:
-            json.dump(store, f, indent=2, default=str)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, SESSIONS_STORE)
+        save_sessions_to_disk(
+            sessions,
+            active_session_id,
+            SESSIONS_STORE,
+            _machine_overrides_from_engine,
+        )
     except Exception as exc:
         print(f'[sessions] save error: {exc}')
 
 
 def _load_sessions_from_disk():
-    """Restore session metadata from sessions_store.json on startup."""
     global sessions, active_session_id
-    if not SESSIONS_STORE.exists():
-        return
-    try:
-        with open(SESSIONS_STORE, 'r', encoding='utf-8') as f:
-            store = json.load(f)
-        for sid, data in store.get('sessions', {}).items():
-            sessions[sid] = {
-                'id':            data.get('id', sid),
-                'file_path':     data.get('file_path', ''),
-                'extract_files': data.get('extract_files'),
-                'filename':      data.get('filename', ''),
-                'custom_name':   data.get('custom_name'),
-                'is_snapshot':   data.get('is_snapshot', False),
-                'engine':        None,   # must re-calculate after restart
-                'value_results': {},
-                'metadata':      data.get('metadata', {}),
-                'uploaded_at':   data.get('uploaded_at', ''),
-                'parameters':    data.get('parameters'),
-                'pending_edits': data.get('pending_edits', {}),
-                'value_aux_overrides': data.get('value_aux_overrides', {}),
-                'machine_overrides': data.get('machine_overrides', {}),
-                'valuation_params': data.get('valuation_params'),
-                'undo_stack':    [],
-                'redo_stack':    [],
-            }
-        saved_active = store.get('active_session_id')
-        if saved_active and saved_active in sessions:
-            active_session_id = saved_active
-        elif sessions:
-            active_session_id = next(iter(sessions))
-        pass
-    except Exception as exc:
-        sessions = {}
-        active_session_id = None
-        print(f'[sessions] load error: {exc}')
-        try:
-            corrupt_path = SESSIONS_STORE.with_name(
-                f'{SESSIONS_STORE.name}.corrupt-{datetime.now().strftime("%Y%m%d%H%M%S")}'
-            )
-            SESSIONS_STORE.replace(corrupt_path)
-            print(f'[sessions] corrupt store moved to: {corrupt_path}')
-        except Exception as move_exc:
-            print(f'[sessions] corrupt store could not be moved: {move_exc}')
+    sessions, active_session_id = load_sessions_from_disk(SESSIONS_STORE)
 
 
 def _apply_folder_config():
