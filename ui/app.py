@@ -36,6 +36,7 @@ from ui.replay import (
     recalculate_value_results,
     replay_pending_edits,
 )
+from ui.routes.config import create_config_folders_blueprint
 from ui.routes.license import create_license_blueprint
 from ui.engine_rebuild import (
     build_clean_engine_for_session,
@@ -232,9 +233,23 @@ def _apply_folder_config():
     _cycle_manager = CycleManager(str(APP_EXPORTS_DIR))
 
 
+def _apply_folder_paths(uploads_dir: Path, exports_dir: Path, sessions_dir: Path) -> None:
+    global APP_UPLOADS_DIR, APP_EXPORTS_DIR, SESSIONS_STORE, _cycle_manager
+    APP_UPLOADS_DIR = uploads_dir
+    APP_EXPORTS_DIR = exports_dir
+    SESSIONS_STORE = sessions_dir / 'sessions_store.json'
+    _cycle_manager = CycleManager(str(APP_EXPORTS_DIR))
+
+
 _load_global_config()
 _apply_folder_config()
 _load_sessions_from_disk()
+app.register_blueprint(create_config_folders_blueprint(
+    _default_folders,
+    _global_config,
+    _save_global_config,
+    _apply_folder_paths,
+))
 
 
 def _replay_pending_edits(sess, engine):
@@ -322,51 +337,6 @@ def _get_active():
 @app.route('/')
 def index():
     return render_template('index.html')
-
-
-@app.route('/api/config/folders', methods=['GET'])
-def get_folder_config():
-    defs = _default_folders()
-    saved = _global_config.get('folders', {})
-    return jsonify({
-        'uploads':  saved.get('uploads')  or defs['uploads'],
-        'exports':  saved.get('exports')  or defs['exports'],
-        'sessions': saved.get('sessions') or defs['sessions'],
-        'defaults': defs,
-    })
-
-
-@app.route('/api/config/folders', methods=['POST'])
-def save_folder_config():
-    global APP_UPLOADS_DIR, APP_EXPORTS_DIR, SESSIONS_STORE, _cycle_manager
-    data = request.get_json(force=True) or {}
-    defs = _default_folders()
-
-    uploads  = (data.get('uploads')  or '').strip() or defs['uploads']
-    exports  = (data.get('exports')  or '').strip() or defs['exports']
-    sessions_dir = (data.get('sessions') or '').strip() or defs['sessions']
-
-    errors = []
-    for label, path in [('uploads', uploads), ('exports', exports), ('sessions', sessions_dir)]:
-        try:
-            Path(path).mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            errors.append(f'{label}: {e}')
-    if errors:
-        return jsonify({'success': False, 'errors': errors}), 400
-
-    _global_config.setdefault('folders', {})
-    _global_config['folders']['uploads']  = uploads
-    _global_config['folders']['exports']  = exports
-    _global_config['folders']['sessions'] = sessions_dir
-    _save_global_config()
-
-    APP_UPLOADS_DIR = Path(uploads)
-    APP_EXPORTS_DIR = Path(exports)
-    SESSIONS_STORE  = Path(sessions_dir) / 'sessions_store.json'
-    _cycle_manager  = CycleManager(str(APP_EXPORTS_DIR))
-
-    return jsonify({'success': True})
 
 
 @app.route('/api/config', methods=['GET'])
