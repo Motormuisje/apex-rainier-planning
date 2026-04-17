@@ -38,6 +38,7 @@ from ui.replay import (
 )
 from ui.routes.config import create_config_blueprint
 from ui.routes.license import create_license_blueprint
+from ui.routes.read import create_read_blueprint
 from ui.engine_rebuild import (
     build_clean_engine_for_session,
     get_config_overrides,
@@ -262,6 +263,11 @@ app.register_blueprint(create_config_blueprint(
     lambda sess, engine: _replay_pending_edits(sess, engine),
     _moq_warnings_payload,
     _value_results_payload,
+))
+app.register_blueprint(create_read_blueprint(
+    lambda: _get_active(),
+    _row_payload,
+    _moq_warnings_payload,
 ))
 
 
@@ -720,208 +726,6 @@ def run_calculations():
         return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
 
 
-@app.route('/api/results')
-def get_results():
-    sess, current_engine = _get_active()
-    if current_engine is None:
-        return jsonify({'error': 'No calculations run'}), 400
-
-    results = {}
-    for lt, rows in current_engine.results.items():
-        results[lt] = [_row_payload(row) for row in rows]
-
-    # Include compact baseline (pre-edit) values so the frontend can restore
-    # cascade highlights after a session reload or instance switch.
-    baseline = sess.get('reset_baseline') if sess else None
-    baseline_results = None
-    if baseline and baseline.get('results'):
-        baseline_results = {
-            lt: [
-                {'material_number': r.get('material_number', ''),
-                 'aux_column': r.get('aux_column', ''),
-                 'values': r.get('values', {})}
-                for r in rows
-            ]
-            for lt, rows in baseline['results'].items()
-        }
-
-    resp = {'periods': current_engine.data.periods, 'results': results}
-    if baseline_results:
-        resp['baseline_results'] = baseline_results
-    resp.update(_moq_warnings_payload(current_engine))
-    return jsonify(resp)
-
-
-@app.route('/api/value_results')
-def get_value_results():
-    """Return value planning results (financial)."""
-    sess, current_engine = _get_active()
-    if current_engine is None:
-        return jsonify({'error': 'No calculations run'}), 400
-
-    if not current_engine.value_results:
-        return jsonify({'error': 'No value planning results available'}), 400
-
-    results = {}
-    for lt, rows in current_engine.value_results.items():
-        results[lt] = [_row_payload(row) for row in rows]
-
-    # Extract consolidation rows separately for the financial overview
-    consolidation = []
-    for row in current_engine.value_results.get(LineType.CONSOLIDATION.value, []):
-        consolidation.append(_row_payload(row))
-
-    # Include compact baseline value-results so the frontend can restore
-    # VP cascade highlights after a session reload or instance switch.
-    baseline = sess.get('reset_baseline') if sess else None
-    baseline_value_results = None
-    if baseline and baseline.get('value_results'):
-        baseline_value_results = {
-            lt: [
-                {'material_number': r.get('material_number', ''),
-                 'aux_column': r.get('aux_column', ''),
-                 'values': r.get('values', {})}
-                for r in rows
-            ]
-            for lt, rows in baseline['value_results'].items()
-        }
-
-    resp = {
-        'periods': current_engine.data.periods,
-        'results': results,
-        'consolidation': consolidation,
-    }
-    if baseline_value_results:
-        resp['baseline_value_results'] = baseline_value_results
-    return jsonify(resp)
-
-
-@app.route('/api/dashboard')
-def get_dashboard():
-    """Aggregated dashboard endpoint â€” single call returns all KPIs + chart data."""
-    _, current_engine = _get_active()
-    if current_engine is None:
-        return jsonify({'error': 'No calculations run'}), 400
-
-    periods = current_engine.data.periods
-
-    # â”€â”€ KPI: materials count â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    materials_count = len(current_engine.data.materials)
-
-    # â”€â”€ KPI: avg utilization from Line 10 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    util_rows = current_engine.results.get(LineType.UTILIZATION_RATE.value, [])
-    all_util_vals = [v * 100 for row in util_rows for v in row.values.values() if v is not None]
-    avg_utilization = round(sum(all_util_vals) / len(all_util_vals), 1) if all_util_vals else 0.0
-
-    # â”€â”€ KPI: total FTE from Line 12, sum across all groups for latest period â”€
-    fte_rows = current_engine.results.get(LineType.FTE_REQUIREMENTS.value, [])
-    latest_period = periods[-1] if periods else None
-    total_fte = round(
-        sum(row.values.get(latest_period, 0.0) for row in fte_rows), 2
-    ) if latest_period else 0.0
-
-    # â”€â”€ utilization_by_machine (Line 10 rows, values as %) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    utilization_by_machine = []
-    for row in util_rows:
-        utilization_by_machine.append({
-            'machine': row.material_name,
-            'group': row.aux_column or '',
-            'values': {p: round(v * 100, 1) for p, v in row.values.items()},
-        })
-
-    # â”€â”€ fte_by_group (Line 12 rows) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    fte_by_group = []
-    for row in fte_rows:
-        fte_by_group.append({
-            'group': row.material_name,
-            'values': {p: round(v, 2) for p, v in row.values.items()},
-        })
-
-    # â”€â”€ financials from consolidation rows â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    financials = {}
-    for row in current_engine.value_results.get(LineType.CONSOLIDATION.value, []):
-        key = row.material_number.replace('ZZZZZZ_', '')
-        # ROCE is a ratio (e.g. 0.042 = 4.2%) â€” preserve precision so the
-        # frontend can multiply by 100.  All other P&L rows are large EUR
-        # amounts that round cleanly to 0 decimal places.
-        decimals = 6 if key == 'ROCE' else 0
-        financials[key] = {p: round(v, decimals) for p, v in row.values.items()}
-
-    # â”€â”€ inventory quality â€” cached in engine, recomputed only after an edit â”€â”€
-    inventory_quality: list = []
-    top_10_overstocks: list = []
-    total_overstock = 0.0
-    try:
-        from modules.inventory_quality_engine import InventoryQualityEngine
-        if not getattr(current_engine, '_iq_cache', None):
-            iq_result = InventoryQualityEngine(
-                current_engine.data,
-                current_engine.results,
-                current_engine.value_results,
-            ).calculate()
-            current_engine._iq_cache = iq_result
-        else:
-            iq_result = current_engine._iq_cache
-        inventory_quality = iq_result.get('per_material', [])
-        top_10_overstocks = iq_result.get('top_10_overstocks', [])
-        total_overstock = iq_result.get('total_overstock', 0.0)
-    except (ImportError, Exception):
-        pass
-
-    # Aggregate total demand (Line 03) across all materials per period
-    demand_trend = {}
-    for row in current_engine.results.get('03. Total demand', []):
-        for p in periods:
-            demand_trend[p] = round(demand_trend.get(p, 0.0) + row.values.get(p, 0.0), 1)
-
-    # Aggregate inventory (Line 04) and target stock (Line 05) per period
-    inventory_trend = {}
-    target_trend = {}
-    for row in current_engine.results.get('04. Inventory', []):
-        for p in periods:
-            inventory_trend[p] = round(inventory_trend.get(p, 0.0) + row.values.get(p, 0.0), 1)
-    for row in current_engine.results.get('05. Minimum target stock', []):
-        for p in periods:
-            target_trend[p] = round(target_trend.get(p, 0.0) + row.values.get(p, 0.0), 1)
-
-    return jsonify({
-        'periods': periods,
-        'kpis': {
-            'materials': materials_count,
-            'avg_utilization': avg_utilization,
-            'total_fte': total_fte,
-            'total_overstock': total_overstock,
-        },
-        'utilization_by_machine': utilization_by_machine,
-        'fte_by_group': fte_by_group,
-        'financials': financials,
-        'inventory_quality': inventory_quality,
-        'top_10_overstocks': top_10_overstocks,
-        'demand_trend': demand_trend,
-        'inventory_trend': inventory_trend,
-        'target_trend': target_trend,
-    })
-
-
-@app.route('/api/capacity')
-def get_capacity():
-    _, current_engine = _get_active()
-    if current_engine is None:
-        return jsonify({'error': 'No calculations run'}), 400
-
-    utilization = []
-    for row in current_engine.results.get(LineType.UTILIZATION_RATE.value, []):
-        utilization.append({
-            'machine': row.material_name,
-            'group': row.product_family or '',
-            'values': {p: round(v * 100, 1) for p, v in row.values.items()}
-        })
-
-    return jsonify({
-        'periods': current_engine.data.periods,
-        'utilization': utilization
-    })
-
 
 @app.route('/api/machines')
 def get_machines():
@@ -1370,70 +1174,6 @@ def redo_machine_param():
         **_planning_value_payload(current_engine),
     })
 
-
-@app.route('/api/inventory')
-def get_inventory():
-    _, current_engine = _get_active()
-    if current_engine is None:
-        return jsonify({'error': 'No calculations run'}), 400
-    
-    inv_rows = current_engine.results.get(LineType.INVENTORY.value, [])
-    tgt_rows = current_engine.results.get(LineType.MIN_TARGET_STOCK.value, [])
-    
-    target_lookup = {r.material_number: r.values for r in tgt_rows}
-    periods = current_engine.data.periods
-    
-    data = []
-    ok, low, high = 0, 0, 0
-    
-    for row in inv_rows:
-        target = target_lookup.get(row.material_number, {})
-        avg_inv = sum(row.values.get(p, 0) for p in periods) / len(periods) if periods else 0
-        avg_tgt = sum(target.get(p, 0) for p in periods) / len(periods) if target and periods else 0
-        
-        status = 'OK'
-        if avg_inv <= 0:
-            status = 'LOW'
-            low += 1
-        elif avg_tgt > 0:
-            if avg_inv < avg_tgt * 0.5:
-                status = 'LOW'
-                low += 1
-            elif avg_inv > avg_tgt * 2:
-                status = 'HIGH'
-                high += 1
-            else:
-                ok += 1
-        else:
-            ok += 1
-        
-        data.append({
-            'material_number': row.material_number,
-            'material_name': row.material_name,
-            'status': status,
-            'values': row.values
-        })
-    
-    return jsonify({
-        'periods': current_engine.data.periods,
-        'summary': {'healthy': ok, 'low': low, 'high': high},
-        'data': data
-    })
-
-
-@app.route('/api/inventory_quality')
-def get_inventory_quality():
-    _, current_engine = _get_active()
-    if current_engine is None:
-        return jsonify({'error': 'No calculations run'}), 400
-
-    from modules.inventory_quality_engine import InventoryQualityEngine
-    engine = InventoryQualityEngine(
-        current_engine.data,
-        current_engine.results,
-        current_engine.value_results,
-    )
-    return jsonify(engine.calculate())
 
 
 @app.route('/api/export')
@@ -3238,4 +2978,5 @@ if __name__ == '__main__':
     host = os.getenv('SOP_HOST', '127.0.0.1')
     port = int(os.getenv('SOP_PORT', '5000'))
     app.run(debug=False, host=host, port=port)
+
 
