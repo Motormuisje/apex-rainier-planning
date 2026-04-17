@@ -9,19 +9,32 @@ blijven leidend voor alles wat sessie-, config- of engine-state raakt.
 
 ## Huidige routegroepen
 
-Al verplaatst:
+Alle Flask routefuncties zijn uit `ui/app.py` verplaatst naar blueprints:
+- Top-level workflow/upload/calculate routes: `ui/routes/workflow.py`
 - License routes: `ui/routes/license.py`
 - Config/folder routes: `ui/routes/config.py`
 - Read-only result routes: `ui/routes/read.py`
 - Machine routes: `ui/routes/machines.py`
 - PAP routes: `ui/routes/pap.py`
+- Session routes: `ui/routes/sessions.py`
+- Scenario routes: `ui/routes/scenarios.py`
+- Export/MoM routes: `ui/routes/exports.py`
+- Edit metadata/pending-edit routes: `ui/routes/edit_state.py`
+- Edit/cascade routes: `ui/routes/edits.py`
 
-Nog in `ui/app.py`:
-- Start/upload/calculate routes
-- Export/MoM routes
-- Edit routes
-- Scenario routes
-- Session routes
+`ui/app.py` blijft bewust de composition root:
+- Flask app aanmaken en blueprints registreren.
+- Module-globals beheren: `sessions`, `active_session_id`, `_global_config`.
+- Folder/config/session store bootstrap.
+- Engine rebuild/replay/snapshot wrappers.
+- Edit cascade helpers zoals `_apply_volume_change`, `_recalc_one_material`,
+  `_recalc_material_subtree`, `_recalculate_capacity_and_values`.
+- Export highlighting helper `_apply_edit_highlights`.
+- Auto-save `after_request` hook.
+
+Belangrijk: de routefiles mogen de cascade helpers aanroepen via dependency
+injection, maar mogen de numerieke cascade niet stil herschrijven. De routefiles
+zijn bedoeld als request/response-laag.
 
 ## Sessions
 
@@ -233,7 +246,7 @@ Minimale test:
 
 ## Refactor Checklist Per Routegroep
 
-Voor elke verplaatsing:
+Voor elke nieuwe routewijziging:
 - Verplaats routefuncties naar `ui/routes/<groep>.py`.
 - Injecteer dependencies via `create_<groep>_blueprint(...)`.
 - Laat numerieke/cascade helpers staan tot een aparte, bewuste refactor.
@@ -250,3 +263,64 @@ Bij nieuwe of gewijzigde state expliciet beantwoorden:
 - Wordt het gereplayed of opnieuw berekend na rebuild?
 - Triggert het de juiste downstream recalculatie?
 - Wordt het geserialized en opnieuw geladen?
+
+## Huidige Blueprint Map
+
+Deze endpoints horen bij de routefiles:
+
+- `ui/routes/workflow.py`
+  - `GET /`
+  - `POST /api/upload`
+  - `POST /api/calculate`
+- `ui/routes/config.py`
+  - `GET/POST /api/config/folders`
+  - `GET /api/config`
+  - `POST /api/config/master-file`
+  - `POST /api/config/settings`
+  - `POST /api/config/reset_vp_params`
+- `ui/routes/read.py`
+  - `GET /api/results`
+  - `GET /api/value_results`
+  - `GET /api/dashboard`
+  - `GET /api/capacity`
+  - `GET /api/inventory`
+  - `GET /api/inventory_quality`
+- `ui/routes/machines.py`
+  - `GET /api/machines`
+  - `POST /api/machines/update`
+  - `POST /api/machines/undo`
+  - `POST /api/machines/reset`
+  - `POST /api/machines/redo`
+- `ui/routes/pap.py`
+  - `GET/POST /api/pap`
+  - `DELETE /api/pap/<material_number>`
+- `ui/routes/sessions.py`
+  - `GET /api/sessions`
+  - `POST /api/sessions/snapshot`
+  - `POST /api/sessions/rename`
+  - `POST /api/sessions/switch`
+  - `DELETE /api/sessions/<session_id>`
+- `ui/routes/scenarios.py`
+  - `GET /api/scenarios`
+  - `POST /api/scenarios/save`
+  - `POST /api/scenarios/load`
+  - `DELETE /api/scenarios/<scenario_id>`
+  - `POST /api/scenarios/compare`
+  - `GET /api/scenarios/compare/export`
+- `ui/routes/exports.py`
+  - `GET /api/export`
+  - `POST /api/export_db`
+  - `GET /api/mom`
+- `ui/routes/edit_state.py`
+  - `GET /api/editable_line_types`
+  - `POST /api/sessions/edits/persist`
+  - `POST /api/sessions/edits/sync`
+- `ui/routes/edits.py`
+  - `POST /api/update_volume`
+  - `POST /api/update_value_aux`
+  - `POST /api/reset_value_planning_edits`
+  - `POST /api/undo`
+  - `POST /api/redo`
+  - `GET /api/edits/export`
+  - `POST /api/edits/import`
+  - `POST /api/reset_edits`
