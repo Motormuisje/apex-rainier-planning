@@ -1,12 +1,11 @@
 ﻿"""S&OP Planning Engine - Flask Web UI"""
 
-from flask import Flask, render_template, request, jsonify, send_file
+from flask import Flask, render_template, request, jsonify
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
 import sys
 import io
-import json
 import copy
 import os
 import contextlib
@@ -37,6 +36,7 @@ from ui.replay import (
 )
 from ui.routes.config import create_config_blueprint
 from ui.routes.edit_state import create_edit_state_blueprint
+from ui.routes.edits import create_edits_blueprint
 from ui.routes.exports import create_exports_blueprint
 from ui.routes.license import create_license_blueprint
 from ui.routes.machines import create_machines_blueprint
@@ -332,6 +332,20 @@ app.register_blueprint(create_edit_state_blueprint(
     sessions,
     EDITABLE_LINE_TYPES,
     _save_sessions_to_disk,
+))
+app.register_blueprint(create_edits_blueprint(
+    lambda: _get_active(),
+    VALUE_AUX_EDITABLE_LINE_TYPES,
+    _global_config,
+    lambda *args, **kwargs: _apply_volume_change(*args, **kwargs),
+    _ensure_reset_baseline,
+    lambda engine, sess: _recalculate_value_results(engine, sess),
+    _save_sessions_to_disk,
+    _valuation_params_from_config,
+    _restore_engine_state,
+    _snapshot_has_manual_edits,
+    _build_clean_engine_for_session,
+    _install_clean_engine_baseline,
 ))
 
 
@@ -909,181 +923,6 @@ def _apply_edit_highlights(path: str, engine):
     wb.save(path)
 
 
-@app.route('/api/update_volume', methods=['POST'])
-def update_volume():
-    sess, current_engine = _get_active()
-
-    if current_engine is None:
-        return jsonify({'error': 'No calculations run'}), 400
-
-    data = request.get_json()
-    if not data:
-        return jsonify({'error': 'No JSON body'}), 400
-
-    line_type = data.get('line_type')
-    material_number = data.get('material_number')
-    period = data.get('period')
-    aux_column = str(data.get('aux_column', '') or '')
-    new_value = float(data.get('new_value', 0))
-
-    return _apply_volume_change(sess, current_engine, line_type, material_number, period, new_value,
-                                 aux_column=aux_column,
-                                 push_undo=True)
-
-
-@app.route('/api/update_value_aux', methods=['POST'])
-def update_value_aux():
-    sess, current_engine = _get_active()
-
-    if current_engine is None:
-        return jsonify({'error': 'No calculations run'}), 400
-
-    data = request.get_json() or {}
-    line_type = data.get('line_type')
-    material_number = data.get('material_number')
-    try:
-        new_value = float(data.get('new_value', 0))
-    except (TypeError, ValueError):
-        return jsonify({'error': 'Invalid aux value'}), 400
-
-    if line_type not in VALUE_AUX_EDITABLE_LINE_TYPES:
-        return jsonify({'error': f'Value aux for line type "{line_type}" is not editable'}), 403
-
-    rows = current_engine.value_results.get(line_type, [])
-    target_row = next((r for r in rows if r.material_number == material_number), None)
-    if target_row is None:
-        return jsonify({'error': 'Value row not found'}), 404
-    _ensure_reset_baseline(sess, current_engine)
-
-    try:
-        old_value = float(target_row.aux_column or 0)
-    except (TypeError, ValueError):
-        return jsonify({'error': 'Current aux value is not numeric'}), 400
-
-    override_key = f'{line_type}||{material_number}'
-    overrides = sess.setdefault('value_aux_overrides', {})
-    existing = overrides.get(override_key, {})
-    original_value = float(existing.get('original', old_value)) if isinstance(existing, dict) else old_value
-
-    if abs(new_value - original_value) < 1e-9:
-        overrides.pop(override_key, None)
-    else:
-        overrides[override_key] = {
-            'original': original_value,
-            'new_value': new_value,
-        }
-
-    _recalculate_value_results(current_engine, sess)
-    _save_sessions_to_disk()
-
-    value_results_dict = {lt: [r.to_dict() for r in rs] for lt, rs in current_engine.value_results.items()}
-    consolidation = [r.to_dict() for r in current_engine.value_results.get(LineType.CONSOLIDATION.value, [])]
-    delta_pct = round((new_value - original_value) / abs(original_value) * 100, 2) if original_value != 0 else 0.0
-
-    return jsonify({
-        'success': True,
-        'value_results': value_results_dict,
-        'consolidation': consolidation,
-        'edit_meta': {
-            'old_value': old_value,
-            'new_value': new_value,
-            'original_value': original_value,
-            'delta_pct': delta_pct,
-        },
-        'value_aux_overrides': sess.get('value_aux_overrides', {}),
-    })
-
-
-@app.route('/api/reset_value_planning_edits', methods=['POST'])
-def reset_value_planning_edits():
-    global _global_config
-    sess, current_engine = _get_active()
-    if current_engine is None:
-        return jsonify({'error': 'No calculations run'}), 400
-
-    sess['value_aux_overrides'] = {}
-
-    # Restore valuation parameters from the pre-edit baseline so that global param
-    # changes (NBV, DSO, etc.) are also rolled back, not just per-material aux overrides.
-    baseline_vp = (sess.get('reset_baseline') or {}).get('valuation_params')
-    restored_vp = None
-    if baseline_vp and getattr(current_engine, 'data', None) is not None:
-        current_engine.data.valuation_params = _valuation_params_from_config(baseline_vp)
-        _global_config.setdefault('valuation_params', {})
-        _global_config['valuation_params'] = {str(k): float(v) for k, v in baseline_vp.items()}
-        restored_vp = baseline_vp
-
-    _recalculate_value_results(current_engine, sess)
-    _save_sessions_to_disk()
-
-    value_results_dict = {lt: [r.to_dict() for r in rs] for lt, rs in current_engine.value_results.items()}
-    consolidation = [r.to_dict() for r in current_engine.value_results.get(LineType.CONSOLIDATION.value, [])]
-
-    resp = {
-        'success': True,
-        'value_results': value_results_dict,
-        'consolidation': consolidation,
-        'value_aux_overrides': {},
-    }
-    if restored_vp is not None:
-        resp['restored_valuation_params'] = restored_vp
-    return jsonify(resp)
-
-
-@app.route('/api/undo', methods=['POST'])
-def undo_edit():
-    sess, current_engine = _get_active()
-    if current_engine is None:
-        return jsonify({'error': 'No calculations run'}), 400
-    undo_stack = sess.get('undo_stack', [])
-    redo_stack = sess.setdefault('redo_stack', [])
-    if not undo_stack:
-        return jsonify({'error': 'Nothing to undo'}), 400
-
-    entry = undo_stack.pop()
-    line_type = entry['line_type']
-    material_number = entry['material_number']
-    period = entry['period']
-    aux_column = entry.get('aux_column', '')
-    restore_value = entry['old_value']
-
-    # Push onto redo stack before restoring
-    redo_stack.append(entry)
-    if len(redo_stack) > 50:
-        redo_stack.pop(0)
-
-    # Apply restored value by delegating to update_volume logic (via internal helper)
-    return _apply_volume_change(sess, current_engine, line_type, material_number, period, restore_value,
-                                 aux_column=aux_column,
-                                 push_undo=False)
-
-
-@app.route('/api/redo', methods=['POST'])
-def redo_edit():
-    sess, current_engine = _get_active()
-    if current_engine is None:
-        return jsonify({'error': 'No calculations run'}), 400
-    undo_stack = sess.setdefault('undo_stack', [])
-    redo_stack = sess.get('redo_stack', [])
-    if not redo_stack:
-        return jsonify({'error': 'Nothing to redo'}), 400
-
-    entry = redo_stack.pop()
-    line_type = entry['line_type']
-    material_number = entry['material_number']
-    period = entry['period']
-    aux_column = entry.get('aux_column', '')
-    redo_value = entry['new_value']
-
-    undo_stack.append(entry)
-    if len(undo_stack) > 50:
-        undo_stack.pop(0)
-
-    return _apply_volume_change(sess, current_engine, line_type, material_number, period, redo_value,
-                                 aux_column=aux_column,
-                                 push_undo=False)
-
-
 def _apply_volume_change(sess, current_engine, line_type, material_number, period, new_value,
                           aux_column='',
                           push_undo=True):
@@ -1330,182 +1169,6 @@ def _apply_volume_change(sess, current_engine, line_type, material_number, perio
             'delta_pct': delta_pct,
         },
     })
-
-
-@app.route('/api/edits/export')
-def export_edits():
-    _, current_engine = _get_active()
-    if current_engine is None:
-        return jsonify({'error': 'No calculations run'}), 400
-
-    edits = []
-    for _, rows in current_engine.results.items():
-        for row in rows:
-            if row.manual_edits:
-                for period, edit_data in row.manual_edits.items():
-                    original = edit_data.get('original', 0.0)
-                    new_val = edit_data.get('new', 0.0)
-                    delta_pct = round((new_val - original) / abs(original) * 100, 2) if original != 0 else 0.0
-                    edits.append({
-                        'line_type': row.line_type,
-                        'material_number': row.material_number,
-                        'aux_column': getattr(row, 'aux_column', '') or '',
-                        'period': period,
-                        'original': original,
-                        'new': new_val,
-                        'delta_pct': delta_pct,
-                    })
-
-    value_aux_edits = []
-    sess = sessions.get(active_session_id) if active_session_id else None
-    for key, item in (sess or {}).get('value_aux_overrides', {}).items():
-        try:
-            line_type, material_number = key.split('||', 1)
-            original = float(item.get('original', 0))
-            new_val = float(item.get('new_value', original))
-        except (AttributeError, TypeError, ValueError):
-            continue
-        delta_pct = round((new_val - original) / abs(original) * 100, 2) if original != 0 else 0.0
-        value_aux_edits.append({
-            'line_type': line_type,
-            'material_number': material_number,
-            'original': original,
-            'new': new_val,
-            'delta_pct': delta_pct,
-        })
-
-    export_data = {
-        'exported_at': datetime.now().isoformat(),
-        'edits': edits,
-        'value_aux_edits': value_aux_edits,
-    }
-    buf = io.BytesIO(json.dumps(export_data, indent=2).encode('utf-8'))
-    buf.seek(0)
-    return send_file(buf, mimetype='application/json', as_attachment=True,
-                     download_name='edits.json')
-
-
-@app.route('/api/edits/import', methods=['POST'])
-def import_edits():
-    sess, current_engine = _get_active()
-
-    if current_engine is None:
-        return jsonify({'error': 'No calculations run'}), 400
-
-    try:
-        data = request.get_json()
-        if not data:
-            return jsonify({'error': 'No JSON body'}), 400
-
-        edits = data.get('edits', [])
-        for edit in edits:
-            line_type = edit.get('line_type')
-            material_number = edit.get('material_number')
-            period = edit.get('period')
-            new_value = float(edit.get('new', 0))
-            aux_column = str(edit.get('aux_column', '') or '')
-            resp = _apply_volume_change(
-                sess,
-                current_engine,
-                line_type,
-                material_number,
-                period,
-                new_value,
-                aux_column=aux_column,
-                push_undo=False,
-            )
-            if resp.status_code >= 400:
-                payload = resp.get_json(silent=True) or {}
-                return jsonify({'error': f'Could not import edit: {payload.get("error", "unknown error")}'}), resp.status_code
-
-        value_aux_edits = data.get('value_aux_edits', [])
-        if value_aux_edits:
-            overrides = sess.setdefault('value_aux_overrides', {})
-            for edit in value_aux_edits:
-                line_type = edit.get('line_type')
-                material_number = edit.get('material_number')
-                if line_type not in VALUE_AUX_EDITABLE_LINE_TYPES:
-                    continue
-                try:
-                    original = float(edit.get('original', 0))
-                    new_value = float(edit.get('new', original))
-                except (TypeError, ValueError):
-                    continue
-                key = f'{line_type}||{material_number}'
-                if abs(new_value - original) < 1e-9:
-                    overrides.pop(key, None)
-                else:
-                    overrides[key] = {
-                        'original': original,
-                        'new_value': new_value,
-                    }
-
-        # Re-run value planning
-        _recalculate_value_results(current_engine, sess)
-        _save_sessions_to_disk()
-
-        results_dict = {lt: [r.to_dict() for r in rs] for lt, rs in current_engine.results.items()}
-        value_results_dict = {lt: [r.to_dict() for r in rs] for lt, rs in current_engine.value_results.items()}
-        consolidation = [r.to_dict() for r in current_engine.value_results.get(LineType.CONSOLIDATION.value, [])]
-
-        return jsonify({
-            'success': True,
-            'results': results_dict,
-            'value_results': value_results_dict,
-            'consolidation': consolidation,
-            'value_aux_overrides': sess.get('value_aux_overrides', {}),
-        })
-    except Exception as e:
-        import traceback
-        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
-
-
-@app.route('/api/reset_edits', methods=['POST'])
-def reset_edits():
-    sess, current_engine = _get_active()
-    if current_engine is None:
-        return jsonify({'error': 'No calculations run'}), 400
-
-    baseline = sess.get('reset_baseline')
-    baseline_is_clean = (
-        isinstance(baseline, dict)
-        and baseline.get('results')
-        and not _snapshot_has_manual_edits(baseline)
-    )
-    if baseline_is_clean:
-        _restore_engine_state(current_engine, baseline)
-        engine = current_engine
-    else:
-        # Fallback: rebuild from source file when no clean baseline exists.
-        engine = _build_clean_engine_for_session(sess)
-        if engine is None:
-            return jsonify({'error': 'No clean reset baseline available. Recalculate this session first.'}), 400
-        sess['engine'] = engine
-
-    # Clear all edit tracking
-    sess['pending_edits'] = {}
-    sess['value_aux_overrides'] = {}
-    sess['undo_stack'] = []
-    sess['redo_stack'] = []
-    # Recompute values from restored planning state to guarantee consistency.
-    _recalculate_value_results(engine, sess)
-    _install_clean_engine_baseline(sess, engine)
-    _save_sessions_to_disk()
-
-    results_dict = {lt: [r.to_dict() for r in rs] for lt, rs in engine.results.items()}
-    value_results_dict = {lt: [r.to_dict() for r in rs] for lt, rs in engine.value_results.items()}
-    consolidation = [r.to_dict() for r in engine.value_results.get(LineType.CONSOLIDATION.value, [])]
-
-    resp = {
-        'success': True,
-        'results': results_dict,
-        'value_results': value_results_dict,
-        'consolidation': consolidation,
-    }
-    restored_vp = _global_config.get('valuation_params')
-    if restored_vp:
-        resp['restored_valuation_params'] = restored_vp
-    return jsonify(resp)
 
 
 # ---- Prod/Purch Split endpoints ----
