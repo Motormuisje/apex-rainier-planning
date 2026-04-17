@@ -1,0 +1,66 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ===== Virtual environments =====
+.venv/
+venv/
+env/
+ENV/
+
+# ===== IDE / OS =====
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ===== Runtime data — NEVER commit =====
+# These hold client data, licenses, and big Excel files.
+# App writes them to %LOCALAPPDATA% by default anyway.
+uploads/
+exports/
+imports/
+sessions/
+logs/
+audits/
+debug/
+client-reports/
+
+# ===== Binary data files =====
+# Exception: small fixtures for tests can live in tests/fixtures/
+# and you'd un-ignore them explicitly.
+*.xlsm
+*.xlsx
+*.xls
+*.csv
+*.parquet
+*.db
+*.sqlite
+
+# ===== Licensing & secrets =====
+licenses/
+*.license
+*.key
+.env
+.env.*
+!.env.example
+config.local.*
+secrets/
+
+# ===== Build artifacts =====
+build/
+dist/
+*.exe
+*.spec
+
+# ===== Claude Code / agent scratch =====
+.claude/cache/
+.codex/cache/
+scratch/
+tmp/

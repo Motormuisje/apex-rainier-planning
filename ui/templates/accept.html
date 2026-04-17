@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Apex Rainier Planning — License</title>
+    <link rel="icon" href="/static/favicon.png" type="image/png">
+    <link rel="shortcut icon" href="/static/favicon.ico" type="image/x-icon">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); min-height: 100vh; }
+    </style>
+</head>
+<body class="flex items-center justify-center min-h-screen p-6">
+<div class="w-full max-w-lg">
+
+    <!-- Logo / header -->
+    <div class="flex flex-col items-center mb-8">
+        <img src="/static/logo.png" alt="Apex Rainier" class="h-24 mb-4" onerror="this.style.display='none'">
+        <h1 class="text-2xl font-bold text-white tracking-wide">Apex Rainier Planning<span class="text-xs align-super">™</span></h1>
+        <p class="text-slate-400 text-sm mt-1">v1.0 — by Apex Strategies BV</p>
+    </div>
+
+    {% if mode == 'accept' %}
+    <!-- ── ACCEPT SCREEN ── -->
+    <div class="rounded-xl border border-slate-700 bg-slate-800/80 p-7 shadow-xl">
+        <h2 class="text-lg font-semibold text-white mb-1">Trial License Agreement</h2>
+        <p class="text-slate-400 text-sm mb-4">
+            This software is provided for a <strong class="text-slate-200">14-day evaluation period</strong>
+            starting from the moment you click <em>I Accept</em>.
+            After this period the application will no longer be accessible.
+        </p>
+
+        <div class="rounded-lg border border-slate-600 bg-slate-900/60 p-4 h-44 overflow-y-auto text-xs text-slate-400 mb-5 leading-relaxed">
+            <p class="mb-2 font-semibold text-slate-300">End-User License Agreement (EULA)</p>
+            <p class="mb-2">This software ("Apex Rainier Planning") is the proprietary property of Apex Strategies BV. All rights reserved.</p>
+            <p class="mb-2">1. <strong class="text-slate-300">Grant of License.</strong> Apex Strategies BV grants you a non-exclusive, non-transferable, limited right to install and use this software solely for your internal business purposes during the evaluation period.</p>
+            <p class="mb-2">2. <strong class="text-slate-300">Restrictions.</strong> You may not copy, modify, distribute, sell, sublicense, reverse engineer, decompile, or disassemble this software, in whole or in part.</p>
+            <p class="mb-2">3. <strong class="text-slate-300">Evaluation Period.</strong> The evaluation period is 14 calendar days from first activation. Use beyond this period requires a commercial license from Apex Strategies BV.</p>
+            <p class="mb-2">4. <strong class="text-slate-300">No Warranty.</strong> This software is provided "as is" without warranty of any kind. Apex Strategies BV shall not be liable for any damages arising from the use of this software.</p>
+            <p class="mb-2">5. <strong class="text-slate-300">Governing Law.</strong> This agreement is governed by the laws of the Netherlands.</p>
+        </div>
+
+        <div class="flex items-start gap-3 mb-5">
+            <input type="checkbox" id="chk" class="mt-1 w-4 h-4 accent-blue-500 cursor-pointer">
+            <label for="chk" class="text-sm text-slate-300 cursor-pointer">
+                I have read and agree to the terms of the End-User License Agreement.
+            </label>
+        </div>
+
+        <button id="btnAccept" disabled
+            class="w-full py-2.5 rounded-lg font-semibold text-sm transition-all
+                   bg-slate-700 text-slate-500 cursor-not-allowed"
+            onclick="doAccept()">
+            I Accept — Start 14-Day Trial
+        </button>
+        <p id="err" class="text-red-400 text-xs mt-3 hidden text-center"></p>
+    </div>
+
+    <script>
+        document.getElementById('chk').addEventListener('change', function () {
+            const btn = document.getElementById('btnAccept');
+            if (this.checked) {
+                btn.disabled = false;
+                btn.className = 'w-full py-2.5 rounded-lg font-semibold text-sm transition-all bg-gradient-to-r from-blue-600 to-blue-500 text-white cursor-pointer hover:from-blue-500 hover:to-blue-400';
+            } else {
+                btn.disabled = true;
+                btn.className = 'w-full py-2.5 rounded-lg font-semibold text-sm transition-all bg-slate-700 text-slate-500 cursor-not-allowed';
+            }
+        });
+
+        async function doAccept() {
+            const btn = document.getElementById('btnAccept');
+            const err = document.getElementById('err');
+            btn.disabled = true;
+            btn.textContent = 'Activating…';
+            err.classList.add('hidden');
+            try {
+                const res = await fetch('/api/license/activate', { method: 'POST' });
+                const data = await res.json();
+                if (data.success) {
+                    window.location.href = '/';
+                } else {
+                    err.textContent = data.error || 'Activation failed.';
+                    err.classList.remove('hidden');
+                    btn.disabled = false;
+                    btn.textContent = 'I Accept — Start 14-Day Trial';
+                }
+            } catch (e) {
+                err.textContent = 'Network error — please try again.';
+                err.classList.remove('hidden');
+                btn.disabled = false;
+                btn.textContent = 'I Accept — Start 14-Day Trial';
+            }
+        }
+    </script>
+
+    {% elif mode == 'expired' %}
+    <!-- ── EXPIRED SCREEN ── -->
+    <div class="rounded-xl border border-red-800/60 bg-slate-800/80 p-7 shadow-xl text-center">
+        <div class="text-4xl mb-3">⏱</div>
+        <h2 class="text-lg font-semibold text-red-400 mb-2">Trial Period Ended</h2>
+        <p class="text-slate-400 text-sm mb-4">
+            Your 14-day evaluation period expired on
+            <strong class="text-slate-200">{{ info.expires if info else '—' }}</strong>.
+        </p>
+        <p class="text-slate-500 text-xs">
+            To continue using Apex Rainier Planning, please contact
+            <a href="mailto:info@apexstrategies.nl" class="text-blue-400 hover:underline">Apex Strategies BV</a>
+            for a commercial license.
+        </p>
+    </div>
+
+    {% elif mode == 'tampered' %}
+    <!-- ── TAMPERED SCREEN ── -->
+    <div class="rounded-xl border border-yellow-700/60 bg-slate-800/80 p-7 shadow-xl text-center">
+        <div class="text-4xl mb-3">⚠️</div>
+        <h2 class="text-lg font-semibold text-yellow-400 mb-2">License Record Invalid</h2>
+        <p class="text-slate-400 text-sm mb-4">
+            The license record on this machine could not be verified.
+            It may have been modified or moved from another computer.
+        </p>
+        <p class="text-slate-500 text-xs">
+            Please contact
+            <a href="mailto:info@apexstrategies.nl" class="text-blue-400 hover:underline">Apex Strategies BV</a>
+            for assistance.
+        </p>
+    </div>
+    {% endif %}
+
+</div>
+</body>
+</html>
