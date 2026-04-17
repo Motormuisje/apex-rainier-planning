@@ -1,8 +1,8 @@
-# CLAUDE.md — Apex Rainier Planning Tool
+# AGENTS.md — Apex Rainier Planning Tool
 
-**Read this before touching any code.** Loaded into every agent session. If
-you're about to modify code, confirm you understand the contracts and the
-state model below. When in doubt, ask — don't guess.
+**Read this before touching any code.** This is the Codex project instruction
+file. If you're about to modify code, confirm you understand the contracts and
+the state model below. When in doubt, ask — don't guess.
 
 ---
 
