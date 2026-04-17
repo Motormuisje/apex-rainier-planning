@@ -4,7 +4,6 @@ from flask import Flask, render_template, request, jsonify, send_file
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
-from enum import Enum
 import sys
 import io
 import json
@@ -13,33 +12,21 @@ import os
 import contextlib
 from collections import defaultdict
 
+from ui.parsers import (
+    format_purchased_and_produced as _format_purchased_and_produced,
+    parse_purchased_and_produced as _parse_purchased_and_produced,
+)
+from ui.paths import default_app_data_root, default_folders, resource_root
+from ui.serializers import (
+    json_safe as _json_safe,
+    moq_warnings_payload as _moq_warnings_payload,
+    planning_value_payload as _planning_value_payload,
+    row_payload as _row_payload,
+    value_results_payload as _value_results_payload,
+)
 
-def _resource_root() -> Path:
-    """Return the directory that contains bundled app resources.
-
-    In source mode this is the repository root.
-    In a PyInstaller build this resolves to the extraction/bundle root.
-    """
-    if getattr(sys, 'frozen', False):
-        return Path(getattr(sys, '_MEIPASS', Path(sys.executable).parent))
-    return Path(__file__).resolve().parent.parent
-
-
-def _default_app_data_root() -> Path:
-    """Return a user-writable data directory for runtime state."""
-    env_override = os.getenv('SOP_APP_DATA_DIR', '').strip()
-    if env_override:
-        return Path(env_override).expanduser()
-
-    if os.name == 'nt':
-        base = Path(os.getenv('LOCALAPPDATA', Path.home() / 'AppData' / 'Local'))
-    else:
-        base = Path(os.getenv('XDG_DATA_HOME', Path.home() / '.local' / 'share'))
-    return base / 'SOPPlanningEngine'
-
-
-RESOURCE_ROOT = _resource_root()
-APP_DATA_ROOT = _default_app_data_root()
+RESOURCE_ROOT = resource_root()
+APP_DATA_ROOT = default_app_data_root()
 APP_DATA_ROOT.mkdir(parents=True, exist_ok=True)
 
 # Default folder paths — overridden by _apply_folder_config() after config loads
@@ -49,11 +36,7 @@ APP_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 APP_EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 def _default_folders() -> dict:
-    return {
-        'uploads':  str(APP_DATA_ROOT / 'uploads'),
-        'exports':  str(APP_DATA_ROOT / 'exports'),
-        'sessions': str(APP_DATA_ROOT),
-    }
+    return default_folders(APP_DATA_ROOT)
 
 sys.path.insert(0, str(RESOURCE_ROOT))
 
@@ -572,91 +555,6 @@ def _valuation_params_from_config(value) -> ValuationParameters:
         days_sales_outstanding=int(float(vp.get('7', 0) or 0)),
         days_payable_outstanding=int(float(vp.get('8', 0) or 0)),
     )
-
-
-def _moq_warnings_payload(engine) -> dict:
-    """Build moq_raw_needs dict: {mat_num: {period: raw_need}} for frontend MOQ warning rendering."""
-    return {'moq_raw_needs': getattr(engine, 'all_purch_raw_needs', {}) or {}}
-
-
-def _value_results_payload(engine) -> dict:
-    value_results = {
-        lt: [_row_payload(row) for row in rows]
-        for lt, rows in (getattr(engine, 'value_results', {}) or {}).items()
-    }
-    return {
-        'value_results': value_results,
-        'consolidation': value_results.get(LineType.CONSOLIDATION.value, []),
-    }
-
-
-def _planning_value_payload(engine) -> dict:
-    return {
-        'periods': list(getattr(engine.data, 'periods', []) or []),
-        'results': {
-            lt: [_row_payload(row) for row in rows]
-            for lt, rows in (getattr(engine, 'results', {}) or {}).items()
-        },
-        **_value_results_payload(engine),
-        **_moq_warnings_payload(engine),
-    }
-
-
-def _parse_purchased_and_produced(value) -> dict:
-    pap = {}
-    for entry in str(value or '').split(','):
-        parts = entry.strip().split(':')
-        if len(parts) != 2:
-            continue
-        mat = parts[0].strip()
-        if not mat:
-            continue
-        try:
-            pap[mat] = float(parts[1].strip())
-        except ValueError:
-            pass
-    return pap
-
-
-def _format_purchased_and_produced(value: dict) -> str:
-    return ', '.join(f'{mat}:{frac}' for mat, frac in sorted((value or {}).items()))
-
-
-def _json_safe(value):
-    """Convert row payloads to plain JSON types.
-
-    Some test doubles and optional model fields can contain objects such as
-    MagicMock. API responses should stay serializable even when an optional
-    display-only field has an unexpected object value.
-    """
-    if value is None or isinstance(value, (str, bool, int)):
-        return value
-    if isinstance(value, float):
-        if value != value or value in (float('inf'), float('-inf')):
-            return None
-        return value
-    if isinstance(value, datetime):
-        return value.isoformat()
-    if isinstance(value, dict):
-        return {str(_json_safe(k)): _json_safe(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_json_safe(v) for v in value]
-    if isinstance(value, Enum):
-        return _json_safe(value.value)
-    try:
-        item = value.item
-    except AttributeError:
-        item = None
-    if callable(item):
-        try:
-            return _json_safe(item())
-        except Exception:
-            pass
-    return str(value)
-
-
-def _row_payload(row) -> dict:
-    return _json_safe(row.to_dict())
 
 
 def _save_sessions_to_disk():
