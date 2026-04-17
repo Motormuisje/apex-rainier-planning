@@ -25,6 +25,11 @@ from ui.serializers import (
     row_payload as _row_payload,
     value_results_payload as _value_results_payload,
 )
+from ui.replay import (
+    get_value_aux_override_values,
+    recalculate_value_results,
+    replay_pending_edits,
+)
 from ui.engine_rebuild import (
     build_clean_engine_for_session,
     get_config_overrides,
@@ -281,79 +286,21 @@ _load_sessions_from_disk()
 
 
 def _replay_pending_edits(sess, engine):
-    """Re-apply saved pending_edits onto a freshly-run engine.
-
-    pending_edits keys are "line_type||material_number||aux_column||period".
-    Replays through the same update path as the UI so full cascades run after
-    restart/session reload (instead of only restoring LT01 values).
-    """
-    pending = sess.get('pending_edits', {})
-    overrides_present = bool((sess or {}).get('value_aux_overrides'))
-    machine_overrides_present = bool((sess or {}).get('machine_overrides'))
-    if not pending:
-        if overrides_present:
-            _recalculate_value_results(engine, sess)
-        if machine_overrides_present and _apply_machine_overrides(engine, sess.get('machine_overrides') or {}):
-            _recalculate_capacity_and_values(engine, sess)
-        return
-
-    for key, edit in pending.items():
-        try:
-            parts = key.split('||')
-            if len(parts) != 4:
-                continue
-            lt, mat, aux, period = parts
-            new_val = float(edit.get('new_value', 0))
-            _resp = _apply_volume_change(
-                sess,
-                engine,
-                lt,
-                mat,
-                period,
-                new_val,
-                aux_column=aux,
-                push_undo=False,
-            )
-            try:
-                payload = _resp.get_json(silent=True) if hasattr(_resp, 'get_json') else None
-                if isinstance(payload, dict) and not payload.get('success', True):
-                    print(f'[replay_pending_edits] skipped "{key}": {payload}')
-            except Exception:
-                pass
-        except Exception as exc:
-            print(f'[replay_pending_edits] failed "{key}": {exc}')
-    if machine_overrides_present and _apply_machine_overrides(engine, sess.get('machine_overrides') or {}):
-        _recalculate_capacity_and_values(engine, sess)
-
-    # Ensure aux overrides are also reflected after replay.
-    if overrides_present:
-        _recalculate_value_results(engine, sess)
+    replay_pending_edits(
+        sess,
+        engine,
+        _apply_volume_change,
+        _apply_machine_overrides,
+        _recalculate_capacity_and_values,
+    )
 
 
 def _get_value_aux_override_values(sess) -> dict:
-    overrides = {}
-    for key, item in (sess or {}).get('value_aux_overrides', {}).items():
-        try:
-            if isinstance(item, dict):
-                overrides[key] = float(item.get('new_value', 0))
-            else:
-                overrides[key] = float(item)
-        except (TypeError, ValueError):
-            continue
-    return overrides
+    return get_value_aux_override_values(sess)
 
 
 def _recalculate_value_results(engine, sess=None):
-    from modules.value_planning_engine import ValuePlanningEngine
-
-    aux_overrides = _get_value_aux_override_values(sess)
-    engine.value_engine = ValuePlanningEngine(
-        engine.data,
-        engine.results,
-        aux_overrides=aux_overrides,
-    )
-    engine.value_results = engine.value_engine.calculate()
-    engine._iq_cache = None
+    recalculate_value_results(engine, sess)
 
 
 def _autorun_sessions():
