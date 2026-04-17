@@ -762,18 +762,22 @@ class DataLoader:
             visited.add(mat)
             if mat not in levels or level > levels[mat]:
                 levels[mat] = level
-            for c in parent_to_children.get(mat, set()):
+            # DETERMINISM FIX: sort children to guarantee stable traversal order
+            for c in sorted(parent_to_children.get(mat, set())):
                 assign(c, level + 1, visited.copy())
 
-        for r in roots:
+        # DETERMINISM FIX: sort roots for stable traversal order
+        for r in sorted(roots):
             assign(r, 0, set())
-        for m in all_mats:
+        # DETERMINISM FIX: sort all_mats for stable fallback order
+        for m in sorted(all_mats):
             if m not in levels:
                 levels[m] = 0
         self.bom_levels = levels
 
     def get_materials_at_level(self, level):
-        return [m for m, l in self.bom_levels.items() if l == level]
+        # DETERMINISM FIX: sort to guarantee stable iteration across runs
+        return sorted(m for m, l in self.bom_levels.items() if l == level)
 
     def get_max_bom_level(self):
         return max(self.bom_levels.values()) if self.bom_levels else 0
