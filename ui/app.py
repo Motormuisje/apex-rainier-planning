@@ -25,6 +25,12 @@ from ui.serializers import (
     row_payload as _row_payload,
     value_results_payload as _value_results_payload,
 )
+from ui.config_store import (
+    apply_folder_config,
+    load_global_config,
+    save_global_config,
+)
+from ui.errors import classify_upload_exception as _classify_upload_exception
 from ui.replay import (
     get_value_aux_override_values,
     recalculate_value_results,
@@ -86,38 +92,6 @@ app = Flask(
 # Allow large Excel uploads (512 MB). Without this, Flask returns a 413 that
 # often surfaces on the client as "TypeError: Failed to fetch".
 app.config['MAX_CONTENT_LENGTH'] = 512 * 1024 * 1024
-
-
-def _classify_upload_exception(exc: Exception, stage: str) -> dict:
-    """Map a raised exception during upload/load to a user-facing payload."""
-    import zipfile
-    tname = type(exc).__name__
-    raw = str(exc) or tname
-    if isinstance(exc, zipfile.BadZipFile):
-        msg = 'Het bestand is geen geldig Excel-bestand (corrupt of verkeerd formaat).'
-        kind = 'bad_zip'
-    elif isinstance(exc, FileNotFoundError):
-        msg = f'Bestand niet gevonden tijdens {stage}: {raw}'
-        kind = 'not_found'
-    elif isinstance(exc, PermissionError):
-        msg = f'Geen toegang tot bestand tijdens {stage}: {raw}'
-        kind = 'permission'
-    elif isinstance(exc, OSError) and 'No space' in raw:
-        msg = 'Schijf vol â€” kan upload niet opslaan.'
-        kind = 'disk_full'
-    elif isinstance(exc, MemoryError):
-        msg = f'Onvoldoende geheugen tijdens {stage}.'
-        kind = 'memory'
-    elif isinstance(exc, KeyError):
-        msg = f'Ontbrekende sheet of kolom tijdens {stage}: {raw}'
-        kind = 'missing_key'
-    elif isinstance(exc, ValueError):
-        msg = f'Ongeldige data tijdens {stage}: {raw}'
-        kind = 'value_error'
-    else:
-        msg = f'Onverwachte fout tijdens {stage}: {tname}: {raw}'
-        kind = 'unknown'
-    return {'error': msg, 'error_kind': kind, 'stage': stage, 'exception': tname}
 
 
 @app.errorhandler(413)
@@ -218,24 +192,11 @@ def _install_clean_engine_baseline(sess, engine, clear_machine_overrides: bool =
 
 def _load_global_config():
     global _global_config
-    if not GLOBAL_CONFIG_FILE.exists():
-        _global_config = {}
-        return
-    try:
-        with open(GLOBAL_CONFIG_FILE, 'r', encoding='utf-8') as f:
-            _global_config = json.load(f)
-    except Exception as exc:
-        import logging
-        logging.getLogger(__name__).error(f'global_config load error: {exc}')
-        _global_config = {}
+    _global_config = load_global_config(GLOBAL_CONFIG_FILE)
 
 
 def _save_global_config():
-    try:
-        with open(GLOBAL_CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(_global_config, f, indent=2, default=str)
-    except Exception as exc:
-        print(f'[global_config] save error: {exc}')
+    save_global_config(GLOBAL_CONFIG_FILE, _global_config)
 
 
 def _get_config_overrides() -> dict:
@@ -262,21 +223,10 @@ def _load_sessions_from_disk():
 def _apply_folder_config():
     """Apply folder paths from _global_config, update globals and CycleManager."""
     global APP_UPLOADS_DIR, APP_EXPORTS_DIR, SESSIONS_STORE, _cycle_manager
-    folders = _global_config.get('folders', {})
-    defs = _default_folders()
-
-    uploads  = folders.get('uploads')  or defs['uploads']
-    exports  = folders.get('exports')  or defs['exports']
-    sessions = folders.get('sessions') or defs['sessions']
-
-    APP_UPLOADS_DIR = Path(uploads)
-    APP_EXPORTS_DIR = Path(exports)
-    SESSIONS_STORE  = Path(sessions) / 'sessions_store.json'
-
-    APP_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-    APP_EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    Path(sessions).mkdir(parents=True, exist_ok=True)
-
+    APP_UPLOADS_DIR, APP_EXPORTS_DIR, SESSIONS_STORE = apply_folder_config(
+        _global_config,
+        _default_folders(),
+    )
     _cycle_manager = CycleManager(str(APP_EXPORTS_DIR))
 
 
