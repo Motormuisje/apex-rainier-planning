@@ -191,6 +191,222 @@ def _engine_to_comparable(engine) -> dict:
     return dict(sorted(out.items()))
 
 
+def _rounded_utilization_by_machine(engine) -> dict:
+    from modules.models import LineType
+
+    return {
+        row.material_name: {
+            period: round(value * 100.0, 1)
+            for period, value in sorted(row.values.items())
+        }
+        for row in engine.results.get(LineType.UTILIZATION_RATE.value, [])
+    }
+
+
+def _fte_totals_by_period(engine) -> dict:
+    from modules.models import LineType
+
+    periods = engine.data.periods
+    totals = {period: 0.0 for period in periods}
+    for row in engine.results.get(LineType.FTE_REQUIREMENTS.value, []):
+        for period in periods:
+            totals[period] += row.values.get(period, 0.0)
+    return {period: round(value, 2) for period, value in totals.items()}
+
+
+def _first_nonzero_period(row):
+    return next((period for period, value in sorted(row.values.items()) if value > 0), None)
+
+
+def _has_routing(engine, material_number: str) -> bool:
+    try:
+        return bool(engine.data.get_all_routings(material_number))
+    except Exception:
+        return False
+
+
+def _find_routed_nonzero_row(engine, line_type: str, excluded_materials=None):
+    excluded_materials = set(excluded_materials or ())
+    for row in engine.results.get(line_type, []):
+        if row.material_number in excluded_materials:
+            continue
+        if _first_nonzero_period(row) is None:
+            continue
+        if _has_routing(engine, row.material_number):
+            return row
+    return None
+
+
+def _find_result_row(engine, line_type: str, material_number: str, aux_column: str):
+    material_rows = [
+        row for row in engine.results.get(line_type, [])
+        if str(getattr(row, 'material_number', '')) == str(material_number)
+    ]
+    target = next(
+        (row for row in material_rows
+         if str(getattr(row, 'aux_column', '') or '').strip() == aux_column),
+        None,
+    )
+    if target is None and len(material_rows) == 1:
+        return material_rows[0]
+    return target
+
+
+def _mutation_callback_called(*args, **kwargs):
+    raise RuntimeError("mutation callback called in read-only test")
+
+
+def test_cross_tab_consistency(golden_fixture_path):
+    """Machines-tab values must match the same engine state used by Planning."""
+    from flask import Flask
+
+    from modules.models import LineType
+    from modules.planning_engine import PlanningEngine
+    from ui.app import (
+        SHIFT_HOURS_LOOKUP_FALLBACK,
+        _apply_volume_change,
+        _machine_overrides_from_engine,
+        app,
+    )
+    from ui.routes.machines import create_machines_blueprint
+
+    engine = PlanningEngine(
+        str(golden_fixture_path),
+        planning_month="2025-12",
+        months_actuals=11,
+        months_forecast=12,
+    )
+    engine.run()
+
+    l01_row = _find_routed_nonzero_row(engine, LineType.DEMAND_FORECAST.value)
+    if l01_row is None:
+        pytest.skip("No routed L01 material with non-zero values found in golden fixture")
+    l01_period = _first_nonzero_period(l01_row)
+    l01_orig = l01_row.values[l01_period]
+    l01_aux = str(getattr(l01_row, 'aux_column', '') or '').strip()
+
+    l06_row = _find_routed_nonzero_row(
+        engine,
+        LineType.PRODUCTION_PLAN.value,
+        excluded_materials={l01_row.material_number},
+    )
+    if l06_row is None:
+        pytest.skip("No routed L06 material distinct from L01 with non-zero values found in golden fixture")
+    l06_period = _first_nonzero_period(l06_row)
+    l06_orig = l06_row.values[l06_period]
+    l06_aux = str(getattr(l06_row, 'aux_column', '') or '').strip()
+
+    before_utilization = _rounded_utilization_by_machine(engine)
+    sess_cross_tab: dict = {'pending_edits': {}, 'undo_stack': [], 'redo_stack': []}
+
+    with app.app_context():
+        _apply_volume_change(
+            sess_cross_tab,
+            engine,
+            LineType.DEMAND_FORECAST.value,
+            l01_row.material_number,
+            l01_period,
+            l01_orig * 1.5,
+            aux_column=l01_aux,
+        )
+        _apply_volume_change(
+            sess_cross_tab,
+            engine,
+            LineType.PRODUCTION_PLAN.value,
+            l06_row.material_number,
+            l06_period,
+            l06_orig * 2,
+            aux_column=l06_aux,
+        )
+
+    l06_after_row = _find_result_row(
+        engine,
+        LineType.PRODUCTION_PLAN.value,
+        l06_row.material_number,
+        l06_aux,
+    )
+    if l06_after_row is None:
+        pytest.fail(
+            "Line 06 edit target disappeared after edit: "
+            f"{l06_row.material_number} / {l06_period} / aux {l06_aux!r}"
+        )
+    if l06_after_row.values.get(l06_period, 0.0) == pytest.approx(l06_orig, abs=0.000001):
+        with app.app_context():
+            _apply_volume_change(
+                sess_cross_tab,
+                engine,
+                LineType.PRODUCTION_PLAN.value,
+                l06_row.material_number,
+                l06_period,
+                l06_orig * 10,
+                aux_column=l06_aux,
+            )
+        l06_after_row = _find_result_row(
+            engine,
+            LineType.PRODUCTION_PLAN.value,
+            l06_row.material_number,
+            l06_aux,
+        )
+        if l06_after_row is None or l06_after_row.values.get(l06_period, 0.0) == pytest.approx(l06_orig, abs=0.000001):
+            pytest.skip(
+                "Routed L06 material did not change after ceiling-rounded edits: "
+                f"{l06_row.material_number} / {l06_period}"
+            )
+
+    after_utilization = _rounded_utilization_by_machine(engine)
+    assert after_utilization != before_utilization, (
+        "Sanity check failed: utilization did not change after routed L01/L06 edits.\n"
+        f"Edit 1: {LineType.DEMAND_FORECAST.value} / {l01_row.material_number}"
+        f" / {l01_period}: {l01_orig} -> {l01_orig * 1.5}\n"
+        f"Edit 2: {LineType.PRODUCTION_PLAN.value} / {l06_row.material_number}"
+        f" / {l06_period}: {l06_orig} -> {l06_after_row.values.get(l06_period)}"
+    )
+
+    def get_active_cross_tab():
+        return sess_cross_tab, engine
+
+    test_app = Flask(__name__)
+    test_app.register_blueprint(create_machines_blueprint(
+        get_active_cross_tab,
+        _machine_overrides_from_engine,
+        lambda machine, data: SHIFT_HOURS_LOOKUP_FALLBACK(machine, data),
+        _mutation_callback_called,
+        _mutation_callback_called,
+        _mutation_callback_called,
+        _mutation_callback_called,
+    ))
+
+    response = test_app.test_client().get('/api/machines')
+    assert response.status_code == 200, response.get_json(silent=True) or response.get_data(as_text=True)
+    payload = response.get_json()
+
+    expected_utilization = _rounded_utilization_by_machine(engine)
+    for machine in payload['machines']:
+        machine_code = machine['code']
+        assert machine_code in expected_utilization, (
+            f"Machines response included {machine_code}, but no "
+            f"{LineType.UTILIZATION_RATE.value} row exists in engine.results"
+        )
+        for period in payload['periods']:
+            assert machine['util_by_period'][period] == pytest.approx(
+                expected_utilization[machine_code].get(period, 0.0),
+                abs=0.05,
+            ), (
+                f"Utilization mismatch for machine {machine_code} / {period}: "
+                "Machines tab payload drifted from planning engine results"
+            )
+
+    expected_fte_totals = _fte_totals_by_period(engine)
+    for period in payload['periods']:
+        assert payload['fte_totals_by_period'][period] == pytest.approx(
+            expected_fte_totals[period],
+            abs=0.005,
+        ), (
+            f"FTE total mismatch for {period}: Machines tab payload drifted "
+            f"from {LineType.FTE_REQUIREMENTS.value} engine results"
+        )
+
+
 def test_replay_matches_live_edits(golden_fixture_path):
     """Replay invariant: replay_pending_edits must produce the same results as live edits.
 
