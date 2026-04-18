@@ -1,4 +1,4 @@
-﻿"""S&OP Planning Engine - Flask Web UI"""
+"""S&OP Planning Engine - Flask Web UI"""
 
 from flask import Flask, request, jsonify
 from pathlib import Path
