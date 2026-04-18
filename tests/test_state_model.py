@@ -172,3 +172,162 @@ def test_partial_reset_preserves_planning_edits(session_with_engine):
         "pending_edits entry was mutated by machine reset. This is the "
         "'reset only affects machines' invariant broken."
     )
+
+
+# --- Engine-results normaliser (copied from tests/generate_baseline.py) -----
+# Not imported because generate_baseline.py is a script, not a module. Both
+# copies must stay in sync if the serialisation format ever changes.
+
+def _engine_to_comparable(engine) -> dict:
+    out: dict = {}
+    for line_type, rows in engine.results.items():
+        per_line: dict = {}
+        for row in rows:
+            per_line[row.material_number] = {
+                period: round(value, 6)
+                for period, value in sorted(row.values.items())
+            }
+        out[line_type] = dict(sorted(per_line.items()))
+    return dict(sorted(out.items()))
+
+
+def test_replay_matches_live_edits(golden_fixture_path):
+    """Replay invariant: replay_pending_edits must produce the same results as live edits.
+
+    From CLAUDE.md: 'replay path is the source of truth — if live behavior
+    diverges from replay, the live behavior is wrong.'
+
+    We build engine A, apply two edits via _apply_volume_change (the real live
+    path, with Flask context), capture pending_edits and results, then replay
+    those same pending_edits on a fresh engine B and assert identical results.
+
+    Both engines are built inside this function rather than shared fixtures
+    because _apply_volume_change mutates engine state in-place. Sharing engine A
+    with the module-scoped fresh_engine would contaminate other tests.
+    """
+    import copy
+
+    from modules.models import LineType
+    from modules.planning_engine import PlanningEngine
+    from ui.app import (
+        _apply_machine_overrides,
+        _apply_volume_change,
+        _recalculate_capacity_and_values,
+        app,
+    )
+    from ui.replay import replay_pending_edits
+
+    # --- Build engine A ---------------------------------------------------
+    engine_a = PlanningEngine(
+        str(golden_fixture_path),
+        planning_month="2025-12",
+        months_actuals=11,
+        months_forecast=12,
+    )
+    engine_a.run()
+
+    # --- Select materials -------------------------------------------------
+    # Edit 1: L01 demand forecast — prefer a BOM child so the cascade is exercised.
+    bom_components = {item.component_material for item in engine_a.data.bom}
+    l01_rows = engine_a.results.get(LineType.DEMAND_FORECAST.value, [])
+
+    edit1_row = next(
+        (r for r in l01_rows
+         if r.material_number in bom_components
+         and any(v > 0 for v in r.values.values())),
+        None,
+    ) or next(
+        (r for r in l01_rows if any(v > 0 for v in r.values.values())),
+        None,
+    )
+    if edit1_row is None:
+        pytest.skip("No L01 material with non-zero values found in golden fixture")
+
+    edit1_period = next(p for p, v in sorted(edit1_row.values.items()) if v > 0)
+    edit1_orig = edit1_row.values[edit1_period]
+    edit1_aux = str(getattr(edit1_row, 'aux_column', '') or '').strip()
+
+    # Edit 2: L06 production plan — different material from edit 1.
+    l06_rows = engine_a.results.get(LineType.PRODUCTION_PLAN.value, [])
+    edit2_row = next(
+        (r for r in l06_rows
+         if r.material_number != edit1_row.material_number
+         and any(v > 0 for v in r.values.values())),
+        None,
+    )
+    if edit2_row is None:
+        pytest.skip("No L06 material (distinct from edit 1) found in golden fixture")
+
+    edit2_period = next(p for p, v in sorted(edit2_row.values.items()) if v > 0)
+    edit2_orig = edit2_row.values[edit2_period]
+    edit2_aux = str(getattr(edit2_row, 'aux_column', '') or '').strip()
+
+    # --- Snapshot baseline (before edits) ---------------------------------
+    baseline_results = _engine_to_comparable(engine_a)
+
+    # --- Apply edits live on engine A ------------------------------------
+    sess_a: dict = {'pending_edits': {}, 'undo_stack': [], 'redo_stack': []}
+
+    with app.app_context():
+        _apply_volume_change(
+            sess_a, engine_a,
+            LineType.DEMAND_FORECAST.value,
+            edit1_row.material_number,
+            edit1_period,
+            edit1_orig * 1.5,
+            aux_column=edit1_aux,
+        )
+        _apply_volume_change(
+            sess_a, engine_a,
+            LineType.PRODUCTION_PLAN.value,
+            edit2_row.material_number,
+            edit2_period,
+            edit2_orig + 100,
+            aux_column=edit2_aux,
+        )
+
+    live_results = _engine_to_comparable(engine_a)
+
+    # --- Build engine B (fresh) and replay --------------------------------
+    engine_b = PlanningEngine(
+        str(golden_fixture_path),
+        planning_month="2025-12",
+        months_actuals=11,
+        months_forecast=12,
+    )
+    engine_b.run()
+
+    sess_b: dict = {
+        'pending_edits': copy.deepcopy(sess_a['pending_edits']),
+        'undo_stack': [],
+        'redo_stack': [],
+        'value_aux_overrides': {},   # replay checks bool(value_aux_overrides)
+        'machine_overrides': {},     # replay checks bool(machine_overrides)
+    }
+
+    with app.app_context():
+        replay_pending_edits(
+            sess_b,
+            engine_b,
+            _apply_volume_change,
+            _apply_machine_overrides,
+            _recalculate_capacity_and_values,
+        )
+
+    replayed_results = _engine_to_comparable(engine_b)
+
+    # --- Assertions -------------------------------------------------------
+    assert live_results == replayed_results, (
+        "Replay invariant broken: replayed results differ from live results.\n"
+        f"Edit 1: {LineType.DEMAND_FORECAST.value} / {edit1_row.material_number}"
+        f" / {edit1_period}: {edit1_orig} -> {edit1_orig * 1.5}\n"
+        f"Edit 2: {LineType.PRODUCTION_PLAN.value} / {edit2_row.material_number}"
+        f" / {edit2_period}: {edit2_orig} -> {edit2_orig + 100}\n"
+        f"pending_edits keys: {list(sess_a['pending_edits'].keys())}"
+    )
+    # Sanity: if this triggers, replay made no changes — the test would be vacuous.
+    assert replayed_results != baseline_results, (
+        "Sanity check failed: replay results equal baseline — "
+        "replay_pending_edits made no changes despite non-empty pending_edits. "
+        f"pending_edits keys: {list(sess_a['pending_edits'].keys())}"
+    )
