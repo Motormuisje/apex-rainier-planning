@@ -1,9 +1,8 @@
 """Helpers for rebuilding clean PlanningEngine instances for UI sessions."""
 
-from typing import Callable
-
 from modules.planning_engine import PlanningEngine
 from ui.parsers import format_purchased_and_produced
+from ui.state_snapshot import snapshot_engine_state
 
 
 def get_config_overrides(global_config: dict) -> dict:
@@ -76,10 +75,10 @@ def build_clean_engine_for_session(
 def install_clean_engine_baseline(
     sess: dict,
     engine,
-    snapshot_engine_state: Callable[[object], dict],
+    shift_hours_lookup,
     clear_machine_overrides: bool = True,
 ) -> None:
-    sess['reset_baseline'] = snapshot_engine_state(engine)
+    sess['reset_baseline'] = snapshot_engine_state(engine, shift_hours_lookup)
     # A fresh calculate invalidates stale machine undo history.
     sess['machine_undo'] = []
     if clear_machine_overrides:

@@ -61,7 +61,6 @@ from ui.state_snapshot import (
     rebuild_volume_caches_from_results as _rebuild_volume_caches_from_results,
     restore_engine_state,
     row_key_from_obj as _row_key_from_obj,
-    snapshot_engine_state,
     snapshot_has_manual_edits as _snapshot_has_manual_edits,
 )
 
@@ -140,10 +139,6 @@ _VERBOSE_STARTUP = os.getenv('SOP_VERBOSE_STARTUP', '').strip().lower() in ('1',
 _DISABLE_AUTORUN = os.getenv('SOP_DISABLE_AUTORUN', '').strip().lower() in ('1', 'true', 'yes', 'on')
 
 
-def _snapshot_engine_state(engine) -> dict:
-    return snapshot_engine_state(engine, SHIFT_HOURS_LOOKUP_FALLBACK)
-
-
 def _sync_global_config_from_engine(engine) -> None:
     """Pull the active session's engine state back into _global_config so all
     subsequent reads/writes use values that belong to the active session."""
@@ -187,7 +182,7 @@ def _install_clean_engine_baseline(sess, engine, clear_machine_overrides: bool =
     install_clean_engine_baseline(
         sess,
         engine,
-        _snapshot_engine_state,
+        SHIFT_HOURS_LOOKUP_FALLBACK,
         clear_machine_overrides=clear_machine_overrides,
     )
 
