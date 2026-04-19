@@ -166,14 +166,6 @@ def _restore_engine_state(engine, snapshot: dict) -> None:
     restore_engine_state(engine, snapshot, _global_config)
 
 
-def _get_session_config_overrides(sess=None) -> dict:
-    return get_session_config_overrides(sess, _global_config)
-
-
-def _build_clean_engine_for_session(sess, params=None):
-    return build_clean_engine_for_session(sess, _global_config, params)
-
-
 def _install_clean_engine_baseline(sess, engine, clear_machine_overrides: bool = True) -> None:
     install_clean_engine_baseline(
         sess,
@@ -247,7 +239,7 @@ app.register_blueprint(create_config_blueprint(
     lambda engine, material_number: _recalc_pap_material(engine, material_number),
     lambda engine: _finish_pap_recalc(engine),
     lambda engine, sess=None: _recalculate_value_results(engine, sess),
-    _build_clean_engine_for_session,
+    lambda sess, params=None: build_clean_engine_for_session(sess, _global_config, params),
     _install_clean_engine_baseline,
     lambda sess, engine: _replay_pending_edits(sess, engine),
     _moq_warnings_payload,
@@ -286,7 +278,7 @@ app.register_blueprint(create_sessions_blueprint(
     _machine_overrides_from_engine,
     _save_sessions_to_disk,
     _sync_global_config_from_engine,
-    _build_clean_engine_for_session,
+    lambda sess, params=None: build_clean_engine_for_session(sess, _global_config, params),
     _install_clean_engine_baseline,
     lambda sess, engine: _replay_pending_edits(sess, engine),
     _snapshot_has_manual_edits,
@@ -330,7 +322,7 @@ app.register_blueprint(create_edits_blueprint(
     _valuation_params_from_config,
     _restore_engine_state,
     _snapshot_has_manual_edits,
-    _build_clean_engine_for_session,
+    lambda sess, params=None: build_clean_engine_for_session(sess, _global_config, params),
     _install_clean_engine_baseline,
 ))
 app.register_blueprint(create_workflow_blueprint(
@@ -397,7 +389,7 @@ def _autorun_sessions():
                     months_actuals=months_actuals,
                     months_forecast=months_forecast,
                     extract_files=sess.get('extract_files'),
-                    config_overrides=_get_session_config_overrides(sess),
+                    config_overrides=get_session_config_overrides(sess, _global_config),
                 )
                 if _VERBOSE_STARTUP:
                     engine.run()
