@@ -23,6 +23,7 @@ from ui.config_store import (
     apply_folder_config,
     load_global_config,
     save_global_config,
+    sync_global_config_from_engine,
 )
 from ui.errors import classify_upload_exception as _classify_upload_exception
 from ui.replay import (
@@ -137,29 +138,6 @@ GLOBAL_CONFIG_FILE = APP_DATA_ROOT / 'global_config.json'
 _global_config: dict = {}
 _VERBOSE_STARTUP = os.getenv('SOP_VERBOSE_STARTUP', '').strip().lower() in ('1', 'true', 'yes', 'on')
 _DISABLE_AUTORUN = os.getenv('SOP_DISABLE_AUTORUN', '').strip().lower() in ('1', 'true', 'yes', 'on')
-
-
-def _sync_global_config_from_engine(engine) -> None:
-    """Pull the active session's engine state back into _global_config so all
-    subsequent reads/writes use values that belong to the active session."""
-    global _global_config
-    if engine is None or getattr(engine, 'data', None) is None:
-        return
-    vp = getattr(engine.data, 'valuation_params', None)
-    if vp is not None:
-        _global_config['valuation_params'] = {
-            '1': vp.direct_fte_cost_per_month,
-            '2': vp.indirect_fte_cost_per_month,
-            '3': vp.overhead_cost_per_month,
-            '4': vp.sga_cost_per_month,
-            '5': vp.depreciation_per_year,
-            '6': vp.net_book_value,
-            '7': vp.days_sales_outstanding,
-            '8': vp.days_payable_outstanding,
-        }
-    pap = getattr(engine.data, 'purchased_and_produced', None)
-    if pap is not None:
-        _global_config['purchased_and_produced'] = _format_purchased_and_produced(pap)
 
 
 def _restore_engine_state(engine, snapshot: dict) -> None:
@@ -285,7 +263,7 @@ app.register_blueprint(create_sessions_blueprint(
     _global_config,
     _machine_overrides_from_engine,
     _save_sessions_to_disk,
-    _sync_global_config_from_engine,
+    lambda engine: sync_global_config_from_engine(engine, _global_config, _format_purchased_and_produced),
     _build_clean_engine_for_session,
     _install_clean_engine_baseline,
     lambda sess, engine: _replay_pending_edits(sess, engine),
