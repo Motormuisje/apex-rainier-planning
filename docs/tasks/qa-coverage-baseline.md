@@ -77,3 +77,39 @@ test sprints: scenarios, config, read, PAP, exports, and license routes.
 `POST /api/sessions/snapshot` was intentionally skipped after route testing
 exposed a production bug where engine deepcopy failure is swallowed and the
 snapshot is returned as successful but uncalculated.
+
+## Post Layer 3 Sprint
+
+Date: 2026-04-19
+
+Browser tests run on demand with `SOP_GOLDEN_FIXTURE` set and are not part of
+the `pytest --cov` suite because they start a real Flask subprocess. Coverage
+numbers below are from the unit + route suite only and are **unchanged** by the
+browser tests.
+
+```powershell
+$env:SOP_GOLDEN_FIXTURE = "$env:LOCALAPPDATA\SOPPlanningEngine\fixtures\golden_MS_RECONC.xlsm"
+pytest --cov=ui --cov=modules --cov-report=term
+```
+
+Result: same 18 tests, 51% overall coverage. Browser tests do not move this
+number because `pytest-cov` does not instrument code running inside a
+`subprocess.Popen` server.
+
+New browser tests added (Playwright, Chromium only):
+
+- `tests/browser/test_load.py`: 3 tests — page loads, table renders, period headers
+- `tests/browser/test_edits.py`: 3 tests — cell edit, heatmap class, undo
+- `tests/browser/test_sessions.py`: 3 tests — session list, switch, delete
+
+Total browser tests: 9. Run with:
+
+```powershell
+$env:SOP_GOLDEN_FIXTURE = "$env:LOCALAPPDATA\SOPPlanningEngine\fixtures\golden_MS_RECONC.xlsm"
+pytest tests/browser/ -v
+```
+
+Subprocess coverage gap: all Flask route code executed via browser tests is not
+captured. The unit + route coverage (51%) remains the authoritative number for
+CI purposes. Browser tests verify rendered DOM state and client-side behavior
+that no HTTP-level test can cover.

@@ -219,3 +219,51 @@ CI.
 Severity: low (test maintenance; no runtime impact)
 
 `test_period_headers_match_planning_month` uses hardcoded column slice — `header_texts[6:]` assumes exactly 6 fixed columns (Material, Name, Line Type, Aux, Aux 2, Start) before the period columns. Currently correct per `index.html:4511`. If a column is added, the slice shifts silently. Future fix: filter on YYYY-MM pattern instead of slicing.
+
+---
+
+## 2026-04-19 — QA Layer 3 browser sprint afgerond
+
+Severity: low (QA infrastructure; no runtime impact)
+
+Layer 3 adds 9 Playwright browser tests across three segments: page load,
+cell edit interactions, and session sidebar management.
+
+Selector strategy summary:
+- Load tests: `#planBody tr[data-material][data-linetype]`, `#planHead th`
+  (slice `[6:]` fragility documented separately)
+- Edit tests: `#planBody td.editable-cell[data-tt="val"][data-lt="01. Demand
+  forecast"][data-period]`, `#editSummaryBar`, `.cell-increased`
+- Session tests: `.session-item`, `.session-item.active`, `.session-name-edit`,
+  `.session-delete`, `#planningMonth`
+
+All selectors are stable IDs, data attributes, or semantic class names from
+the template/JS source. No dynamically generated class names (CSS modules
+hashes) were encountered.
+
+Edit cleanup strategy: `_drain_edits()` calls `/api/undo` in a loop at the
+start of each edit test. Preferred over in-test undo because it handles
+failures in prior tests that left the server in an edited state.
+
+Session state isolation: the `server` fixture is session-scoped (one Flask
+subprocess per test run). Edit tests drain state via API. Session tests
+restore the active session via `/api/sessions/switch` before each page load.
+Throwaway session in delete test is created and destroyed within the test.
+
+`deleteSession()` uses `window.confirm()` (native browser dialog). Playwright
+handles this with `page.once("dialog", lambda d: d.accept())` registered
+before the click. No production code change was needed.
+
+`switchSession()` does not call `setBusy()` directly — it uses an internal
+`_isSwitchingSession` flag. The `wait_for_load_state("networkidle")` pattern
+is sufficient to wait for the full fetch chain (switch → loadResults →
+loadValueResults → renderDashboard → loadSessions).
+
+Remaining manual-only behaviors not covered by any automated test:
+- Scenario flows (PAP tab, scenario creation and comparison)
+- Export to Excel and DB export
+- Config panel (folder path changes, master file upload)
+- Rename session via UI (contenteditable blur handler)
+- MoM comparison tab
+- Mobile viewport / sidebar collapse gesture
+- License expiry and reactivation flow
