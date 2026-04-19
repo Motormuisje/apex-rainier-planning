@@ -211,3 +211,11 @@ Remaining QA gaps: other route modules (`scenarios`, `pap`, `config`,
 `license`, `read`, `exports`), browser/JavaScript behavior, the snapshot bug
 fix, and the dedicated Ruff cleanup pass before Ruff returns to pre-commit or
 CI.
+
+---
+
+## 2026-04-19 — Browser period header assertion slice
+
+Severity: low (test maintenance; no runtime impact)
+
+`test_period_headers_match_planning_month` uses hardcoded column slice — `header_texts[6:]` assumes exactly 6 fixed columns (Material, Name, Line Type, Aux, Aux 2, Start) before the period columns. Currently correct per `index.html:4511`. If a column is added, the slice shifts silently. Future fix: filter on YYYY-MM pattern instead of slicing.

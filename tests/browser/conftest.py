@@ -141,6 +141,7 @@ def server(golden_fixture_path):
             "SOP_HOST": "127.0.0.1",
             "SOP_PORT": str(port),
             "SOP_DISABLE_AUTORUN": "1",
+            "SOP_NO_BROWSER": "1",
             "PYTHONUNBUFFERED": "1",
         }
     )
