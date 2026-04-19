@@ -144,3 +144,21 @@ The current upload route creates a session with metadata and marks it active,
 but it does not attach an engine or run the full planning pipeline. The
 pipeline is run by `/api/calculate`. Tests document this current split rather
 than changing production behavior.
+
+---
+
+## 2026-04-19 — QA Layer 2 segment 2 edit route boundaries
+
+Severity: low (test coverage note; no runtime impact)
+
+Edit route tests cover HTTP orchestration across three blueprints:
+`/api/update_volume`, `/api/machines/reset`, and
+`/api/sessions/edits/persist`.
+
+The `/api/update_volume` test intentionally verifies request-body extraction,
+callback invocation, response propagation, and autosave integration only. It
+does not assert `pending_edits` key schema, undo-stack format, or cascade
+correctness because the real `_apply_volume_change` callback still lives in
+`ui/app.py` and cannot be imported without initializing app-level globals.
+Those behavior details remain covered by the state-model tests until
+`_apply_volume_change` is extracted into a standalone helper module.
