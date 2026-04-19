@@ -55,6 +55,20 @@ pytest -v
 All tests auto-skip if `SOP_GOLDEN_FIXTURE` isn't set, so a fresh checkout
 on a machine without the fixture won't produce false failures.
 
+## Coverage
+
+Install the dev dependencies and run coverage with the golden fixture
+available:
+
+```powershell
+pip install -r requirements-dev.txt
+$env:SOP_GOLDEN_FIXTURE = "$env:LOCALAPPDATA\SOPPlanningEngine\fixtures\golden_MS_RECONC.xlsm"
+pytest --cov=ui --cov=modules --cov-report=term-missing --cov-report=html
+```
+
+The terminal output shows the coverage baseline. The HTML report is written
+to `htmlcov/`, which is local output and is not committed.
+
 ## What the golden test catches
 
 - Any change to the set of line types produced
