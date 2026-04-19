@@ -165,3 +165,49 @@ The isolated blueprint route does not call `save_sessions_to_disk()` directly;
 production save behavior comes from `ui.app`'s app-level `after_request`
 autosave hook. Those behavior details remain covered by the state-model tests
 until `_apply_volume_change` is extracted into a standalone helper module.
+
+---
+
+## 2026-04-19 — Snapshot route silently drops engine on deepcopy failure
+
+Route: `POST /api/sessions/snapshot`
+
+Severity: medium
+
+Behavior: route returns 200 / `success: True` when `copy.deepcopy(engine)`
+raises `TypeError: cannot pickle '_io.BufferedReader' object`. The new session
+is created with `engine = None`, `is_snapshot: True`, and the route docstring
+promise ("duplicate the active session, including all edits") is silently
+broken.
+
+Root cause: unpickleable file handle somewhere in the engine object graph. The
+`except Exception: engine_copy = None` branch swallows the failure with no log,
+no error flag in the response, and no indication to the caller that the
+snapshot is not calculated.
+
+Fix direction (do not implement now): either replace `deepcopy` with a manual
+engine rebuild from the session's `file_path` plus `pending_edits` (the same
+path used after restart), or surface the failure with a 500 or a
+`calculated: False` flag in the response so callers can react.
+
+---
+
+## 2026-04-19 — QA Layer 2 sprint afgerond
+
+Severity: low (QA infrastructure; no runtime impact)
+
+QA Layer 2 added Flask route coverage for workflow, edit, machine reset,
+pending-edit persistence, and session management routes. The snapshot route was
+skipped after tests exposed the medium-severity bug above.
+
+Known fixture simplification: `flask_test_app`, `edit_route_app`, and
+`session_route_app` use a simplified shift-hours lookup in snapshot baselines.
+Machines without `shift_hours_override` snapshot as `0.0` in tests, while
+production uses the real data-model fallback. Current route tests do not
+assert computed shift-hour values, but this should be revisited if future
+route tests depend on machine baseline details.
+
+Remaining QA gaps: other route modules (`scenarios`, `pap`, `config`,
+`license`, `read`, `exports`), browser/JavaScript behavior, the snapshot bug
+fix, and the dedicated Ruff cleanup pass before Ruff returns to pre-commit or
+CI.
