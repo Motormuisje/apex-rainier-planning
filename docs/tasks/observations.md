@@ -112,3 +112,20 @@ imports. Ruff toevoegen vereist eerst een bewuste clean-up pass, niet
 als bijproduct van een hook-installatie. Pre-commit hook draait
 voorlopig alleen pytest. Ruff toevoegen als apart chore-ticket wanneer
 er bandbreedte is.
+
+---
+
+## 2026-04-19 — QA Layer 1 sprint afgerond
+
+Severity: low (QA infrastructure; no runtime impact)
+
+QA Layer 1 now has three pieces of infrastructure: a local pytest
+pre-commit hook, GitHub Actions CI for the fixture-free `no_fixture` test
+subset, and coverage measurement with a recorded baseline.
+
+The current coverage baseline is 48% overall: `modules` is stronger at 59%
+because the golden pipeline exercises the core engines, while `ui` is 36%
+because Flask route behavior is mostly outside Layer 1. The expected next
+QA gaps are Layer 2 Flask route tests, targeted tests for route error paths,
+and a dedicated Ruff cleanup pass before Ruff is reintroduced into
+pre-commit or CI.
