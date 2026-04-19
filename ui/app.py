@@ -55,7 +55,7 @@ from ui.state_snapshot import (
     apply_machine_overrides as _apply_machine_overrides,
     build_pending_edits_from_results_snapshot as _build_pending_edits_from_results_snapshot,
     engine_has_manual_edits as _engine_has_manual_edits,
-    ensure_reset_baseline as _ensure_reset_baseline_impl,
+    ensure_reset_baseline,
     machine_overrides_from_engine as _machine_overrides_from_engine,
     planning_row_from_snapshot as _planning_row_from_snapshot,
     rebuild_volume_caches_from_results as _rebuild_volume_caches_from_results,
@@ -166,10 +166,6 @@ def _restore_engine_state(engine, snapshot: dict) -> None:
     restore_engine_state(engine, snapshot, _global_config)
 
 
-def _ensure_reset_baseline(sess, engine) -> None:
-    _ensure_reset_baseline_impl(sess, engine, SHIFT_HOURS_LOOKUP_FALLBACK)
-
-
 def _get_session_config_overrides(sess=None) -> dict:
     return get_session_config_overrides(sess, _global_config)
 
@@ -247,7 +243,7 @@ app.register_blueprint(create_config_blueprint(
     lambda: _get_active(),
     _parse_purchased_and_produced,
     _valuation_params_from_config,
-    _ensure_reset_baseline,
+    lambda sess, engine: ensure_reset_baseline(sess, engine, SHIFT_HOURS_LOOKUP_FALLBACK),
     lambda engine, material_number: _recalc_pap_material(engine, material_number),
     lambda engine: _finish_pap_recalc(engine),
     lambda engine, sess=None: _recalculate_value_results(engine, sess),
@@ -266,7 +262,7 @@ app.register_blueprint(create_machines_blueprint(
     lambda: _get_active(),
     _machine_overrides_from_engine,
     lambda machine, data: SHIFT_HOURS_LOOKUP_FALLBACK(machine, data),
-    _ensure_reset_baseline,
+    lambda sess, engine: ensure_reset_baseline(sess, engine, SHIFT_HOURS_LOOKUP_FALLBACK),
     lambda engine, sess: _recalculate_capacity_and_values(engine, sess),
     _planning_value_payload,
     _save_sessions_to_disk,
@@ -275,7 +271,7 @@ app.register_blueprint(create_pap_blueprint(
     lambda: _get_active(),
     _global_config,
     _format_purchased_and_produced,
-    _ensure_reset_baseline,
+    lambda sess, engine: ensure_reset_baseline(sess, engine, SHIFT_HOURS_LOOKUP_FALLBACK),
     lambda engine, material_number: _recalc_pap_material(engine, material_number),
     lambda engine: _finish_pap_recalc(engine),
     _save_global_config,
@@ -328,7 +324,7 @@ app.register_blueprint(create_edits_blueprint(
     VALUE_AUX_EDITABLE_LINE_TYPES,
     _global_config,
     lambda *args, **kwargs: _apply_volume_change(*args, **kwargs),
-    _ensure_reset_baseline,
+    lambda sess, engine: ensure_reset_baseline(sess, engine, SHIFT_HOURS_LOOKUP_FALLBACK),
     lambda engine, sess: _recalculate_value_results(engine, sess),
     _save_sessions_to_disk,
     _valuation_params_from_config,
@@ -581,7 +577,7 @@ def _apply_volume_change(sess, current_engine, line_type, material_number, perio
         if available_aux:
             detail += f'. Available aux: {", ".join(available_aux[:6])}'
         return jsonify({'error': detail}), 404
-    _ensure_reset_baseline(sess, current_engine)
+    ensure_reset_baseline(sess, current_engine, SHIFT_HOURS_LOOKUP_FALLBACK)
 
     # Enforce ceiling rounding for L06 line types so the stored value always
     # respects the configured lot multiple (BOM header qty for production plan,
