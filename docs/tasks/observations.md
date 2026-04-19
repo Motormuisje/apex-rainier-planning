@@ -129,3 +129,18 @@ because Flask route behavior is mostly outside Layer 1. The expected next
 QA gaps are Layer 2 Flask route tests, targeted tests for route error paths,
 and a dedicated Ruff cleanup pass before Ruff is reintroduced into
 pre-commit or CI.
+
+---
+
+## 2026-04-19 — QA Layer 2 segment 1 workflow route findings
+
+Severity: low (test coverage note; no runtime impact)
+
+Workflow route tests cover the current `/api/upload` and `/api/calculate`
+HTTP behavior. The Layer 2 sprint spec mentioned `/api/status`, but the
+current workflow blueprint does not define that route.
+
+The current upload route creates a session with metadata and marks it active,
+but it does not attach an engine or run the full planning pipeline. The
+pipeline is run by `/api/calculate`. Tests document this current split rather
+than changing production behavior.
