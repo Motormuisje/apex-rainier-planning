@@ -98,3 +98,42 @@ testable.
 
 **Out of scope for current refactor;** revisit once state-model tests
 are in place to verify behaviour preservation.
+
+---
+
+## 2026-04-19 — Cascade extraction deferred
+
+**Severity:** medium (architectural; no runtime impact)
+
+Attempted to extract `_recalc_pap_material`, `_recalc_material_subtree`,
+and `_finish_pap_recalc` from `ui/app.py` into `ui/cascade.py`. Stopped
+during planning.
+
+**Reason:** `_recalc_one_material` has 9 parameters and
+`_recalc_material_subtree` has 6. A clean extraction requires more than
+four parameters per function, which violates the `AGENTS.md` stop-rule for
+mechanical extractions.
+
+**Dependency facts uncovered:**
+
+- `_recalc_one_material` is called by `_recalc_material_subtree`,
+  `_recalc_pap_material`, and `_apply_volume_change`. It cannot move in
+  isolation.
+- `_finish_pap_recalc` reads `sessions` and `active_session_id` globals.
+  Moving it would require pulling those into the new module or changing its
+  signature to accept `sess` directly.
+
+**Possible future approaches, roughly in order of scope:**
+
+1. Defer until `_apply_volume_change` is refactored, so
+   `_recalc_one_material` can move with its main caller instead of being
+   split across modules.
+2. Design a `CascadeContext` object that bundles dependencies
+   (`_recalculate_capacity_and_values`, `_recalculate_value_results`,
+   active session resolution) so each cascade function takes one context
+   parameter instead of many.
+3. Restructure cascade logic itself so that high parameter counts are not
+   inherent to the functions.
+
+No immediate action. Revisit after `_apply_volume_change` work or when
+cascade design is reviewed holistically.
