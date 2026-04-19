@@ -71,6 +71,7 @@ def flask_test_app(tmp_path):
     from flask import Flask
 
     from ui.routes.workflow import create_workflow_blueprint
+    from ui.state_snapshot import snapshot_engine_state
 
     sessions = {}
     active = {"session_id": None}
@@ -95,6 +96,12 @@ def flask_test_app(tmp_path):
     def save_sessions_to_disk():
         save_calls.append(list(sessions.keys()))
 
+    def install_clean_engine_baseline(sess, engine):
+        sess["reset_baseline"] = snapshot_engine_state(
+            engine,
+            lambda machine, data: float(getattr(machine, "shift_hours_override", None) or 0.0),
+        )
+
     flask_app = Flask(__name__)
     flask_app.config["TESTING"] = True
     flask_app.register_blueprint(create_workflow_blueprint(
@@ -106,7 +113,7 @@ def flask_test_app(tmp_path):
         lambda exc, context: {"error": str(exc), "context": context},
         lambda: {},
         lambda: NoopCycleManager(),
-        lambda sess, engine: sess.update({"reset_baseline": {"installed": True}}),
+        install_clean_engine_baseline,
         lambda sess, engine: None,
         save_sessions_to_disk,
         lambda: flask_app.app_context(),

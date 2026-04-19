@@ -78,5 +78,14 @@ def test_calculate_triggers_pipeline_on_active_session(flask_test_app, golden_fi
     assert sess["engine"].results
     assert sess["parameters"] == payload["parameters"]
     assert sess["metadata"]["planning_month"] == "2025-12"
-    assert sess["reset_baseline"] == {"installed": True}
+    baseline = sess["reset_baseline"]
+    assert set(baseline) >= {
+        "results",
+        "value_results",
+        "valuation_params",
+        "purchased_and_produced",
+        "machines",
+    }
+    assert baseline["results"]
+    assert baseline["machines"]
     assert flask_test_app.save_calls
