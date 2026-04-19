@@ -24,6 +24,28 @@ def save_global_config(config_file: Path, global_config: dict) -> None:
         print(f'[global_config] save error: {exc}')
 
 
+def sync_global_config_from_engine(engine, global_config, format_pap) -> None:
+    """Pull the active session's engine state back into global_config so all
+    subsequent reads/writes use values that belong to the active session."""
+    if engine is None or getattr(engine, 'data', None) is None:
+        return
+    vp = getattr(engine.data, 'valuation_params', None)
+    if vp is not None:
+        global_config['valuation_params'] = {
+            '1': vp.direct_fte_cost_per_month,
+            '2': vp.indirect_fte_cost_per_month,
+            '3': vp.overhead_cost_per_month,
+            '4': vp.sga_cost_per_month,
+            '5': vp.depreciation_per_year,
+            '6': vp.net_book_value,
+            '7': vp.days_sales_outstanding,
+            '8': vp.days_payable_outstanding,
+        }
+    pap = getattr(engine.data, 'purchased_and_produced', None)
+    if pap is not None:
+        global_config['purchased_and_produced'] = format_pap(pap)
+
+
 def resolve_folder_paths(global_config: dict, default_folders: dict) -> tuple[Path, Path, Path]:
     folders = global_config.get('folders', {})
     uploads = folders.get('uploads') or default_folders['uploads']
