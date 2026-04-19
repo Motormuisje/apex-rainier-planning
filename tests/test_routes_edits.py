@@ -15,7 +15,7 @@ def _first_period(row):
     return next(iter(row.values))
 
 
-def test_update_volume_calls_injected_callback_and_autosaves(edit_route_app):
+def test_update_volume_calls_injected_callback(edit_route_app):
     sess = edit_route_app.make_session()
     engine = sess["engine"]
     row = _first_result_row(engine, LineType.DEMAND_FORECAST.value)
@@ -48,7 +48,6 @@ def test_update_volume_calls_injected_callback_and_autosaves(edit_route_app):
     assert call["new_value"] == pytest.approx(123.45)
     assert call["aux_column"] == aux_column
     assert call["push_undo"] is True
-    assert edit_route_app.save_calls
 
 
 def test_machines_reset_clears_only_machine_state(edit_route_app):

@@ -156,9 +156,12 @@ Edit route tests cover HTTP orchestration across three blueprints:
 `/api/sessions/edits/persist`.
 
 The `/api/update_volume` test intentionally verifies request-body extraction,
-callback invocation, response propagation, and autosave integration only. It
-does not assert `pending_edits` key schema, undo-stack format, or cascade
-correctness because the real `_apply_volume_change` callback still lives in
-`ui/app.py` and cannot be imported without initializing app-level globals.
-Those behavior details remain covered by the state-model tests until
-`_apply_volume_change` is extracted into a standalone helper module.
+callback invocation, and response propagation only. It does not assert
+`pending_edits` key schema, undo-stack format, or cascade correctness because
+the real `_apply_volume_change` callback still lives in `ui/app.py` and cannot
+be imported without initializing app-level globals.
+
+The isolated blueprint route does not call `save_sessions_to_disk()` directly;
+production save behavior comes from `ui.app`'s app-level `after_request`
+autosave hook. Those behavior details remain covered by the state-model tests
+until `_apply_volume_change` is extracted into a standalone helper module.

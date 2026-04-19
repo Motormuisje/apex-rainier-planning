@@ -133,7 +133,7 @@ def flask_test_app(tmp_path):
 @pytest.fixture
 def edit_route_app(golden_fixture_path):
     """Minimal Flask app for edit-route tests with in-memory session state."""
-    from flask import Flask, jsonify, request
+    from flask import Flask, jsonify
 
     from modules.planning_engine import PlanningEngine
     from ui.routes.edit_state import create_edit_state_blueprint
@@ -230,12 +230,6 @@ def edit_route_app(golden_fixture_path):
 
     flask_app = Flask(__name__)
     flask_app.config["TESTING"] = True
-
-    @flask_app.after_request
-    def autosave_update_volume(response):
-        if request.method == "POST" and request.path == "/api/update_volume" and response.status_code < 500:
-            save_sessions_to_disk()
-        return response
 
     flask_app.register_blueprint(create_edits_blueprint(
         get_active,
