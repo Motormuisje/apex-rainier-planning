@@ -269,3 +269,119 @@ def edit_route_app(golden_fixture_path):
         volume_calls=volume_calls,
         recalc_calls=recalc_calls,
     )
+
+
+@pytest.fixture
+def session_route_app(golden_fixture_path):
+    """Minimal Flask app for session-route tests with in-memory session state."""
+    from flask import Flask
+
+    from ui.config_store import sync_global_config_from_engine
+    from ui.parsers import format_purchased_and_produced
+    from ui.routes.sessions import create_sessions_blueprint
+    from ui.state_snapshot import (
+        engine_has_manual_edits,
+        machine_overrides_from_engine,
+        snapshot_engine_state,
+        snapshot_has_manual_edits,
+    )
+
+    sessions = {}
+    active = {"session_id": None}
+    global_config = {}
+    save_calls = []
+    sync_calls = []
+
+    def crash_callback(*args, **kwargs):
+        raise RuntimeError("unexpected callback called in session route test")
+
+    def shift_hours_lookup(machine, data):
+        return float(getattr(machine, "shift_hours_override", None) or 0.0)
+
+    def make_session(session_id, engine=None, **overrides):
+        sess = {
+            "id": session_id,
+            "file_path": str(golden_fixture_path),
+            "filename": golden_fixture_path.name,
+            "custom_name": session_id,
+            "engine": engine,
+            "value_results": {},
+            "metadata": {
+                "materials": len(engine.data.materials) if engine else 0,
+                "periods": len(engine.data.periods) if engine else 0,
+                "site": getattr(engine.data.config, "site", "") if engine else "NLX1",
+                "planning_month": "2025-12",
+            },
+            "uploaded_at": "2026-04-19T00:00:00",
+            "parameters": {
+                "planning_month": "2025-12",
+                "months_actuals": 11,
+                "months_forecast": 12,
+            },
+            "pending_edits": {},
+            "value_aux_overrides": {},
+            "machine_overrides": {},
+            "undo_stack": [],
+            "redo_stack": [],
+        }
+        if engine is not None:
+            sess["reset_baseline"] = snapshot_engine_state(engine, shift_hours_lookup)
+        sess.update(overrides)
+        sessions[session_id] = sess
+        if active["session_id"] is None:
+            active["session_id"] = session_id
+        return sess
+
+    def get_active_session_id():
+        return active["session_id"]
+
+    def set_active_session_id(session_id):
+        active["session_id"] = session_id
+
+    def get_active():
+        session_id = active["session_id"]
+        sess = sessions.get(session_id) if session_id else None
+        return sess, sess.get("engine") if sess else None
+
+    def save_sessions_to_disk():
+        save_calls.append(list(sessions.keys()))
+
+    def sync_config(engine):
+        sync_calls.append(engine)
+        sync_global_config_from_engine(engine, global_config, format_purchased_and_produced)
+
+    def install_clean_engine_baseline(sess, engine, clear_machine_overrides=True):
+        sess["reset_baseline"] = snapshot_engine_state(engine, shift_hours_lookup)
+        if clear_machine_overrides:
+            sess["machine_overrides"] = {}
+
+    flask_app = Flask(__name__)
+    flask_app.config["TESTING"] = True
+    flask_app.register_blueprint(create_sessions_blueprint(
+        sessions,
+        get_active_session_id,
+        set_active_session_id,
+        get_active,
+        global_config,
+        machine_overrides_from_engine,
+        save_sessions_to_disk,
+        sync_config,
+        crash_callback,
+        install_clean_engine_baseline,
+        lambda sess, engine: None,
+        snapshot_has_manual_edits,
+        engine_has_manual_edits,
+        lambda: flask_app.app_context(),
+    ))
+
+    return SimpleNamespace(
+        app=flask_app,
+        client=flask_app.test_client(),
+        sessions=sessions,
+        make_session=make_session,
+        get_active_session_id=get_active_session_id,
+        set_active_session_id=set_active_session_id,
+        global_config=global_config,
+        save_calls=save_calls,
+        sync_calls=sync_calls,
+    )

@@ -46,3 +46,34 @@ tests should target route behavior, session switching, edit import/export,
 scenario flows, and workflow upload/calculate paths.
 
 The HTML report was generated in `htmlcov/` and is intentionally ignored.
+
+## Post Layer 2 Sprint
+
+Date: 2026-04-19
+
+Command:
+
+```powershell
+$env:SOP_GOLDEN_FIXTURE = "$env:LOCALAPPDATA\SOPPlanningEngine\fixtures\golden_MS_RECONC.xlsm"
+pytest --cov=ui --cov=modules --cov-report=term
+```
+
+Result: 18 tests passed.
+
+Overall coverage increased from 48% to 51% (5416 statements, 2641 missed).
+The gain came from Flask route tests for workflow, edit, machine reset,
+pending-edit persistence, and session management routes.
+
+Notable route-file changes:
+
+- `ui/routes/workflow.py`: 11% -> 51%
+- `ui/routes/edits.py`: 12% -> 17%
+- `ui/routes/edit_state.py`: 28% -> 64%
+- `ui/routes/machines.py`: 49% -> 56%
+- `ui/routes/sessions.py`: 20% -> 49%
+
+The remaining low-coverage route modules are expected gaps for future route
+test sprints: scenarios, config, read, PAP, exports, and license routes.
+`POST /api/sessions/snapshot` was intentionally skipped after route testing
+exposed a production bug where engine deepcopy failure is swallowed and the
+snapshot is returned as successful but uncalculated.
