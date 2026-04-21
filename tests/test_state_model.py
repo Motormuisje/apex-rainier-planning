@@ -263,10 +263,12 @@ def test_cross_tab_consistency(golden_fixture_path):
     from modules.models import LineType
     from modules.planning_engine import PlanningEngine
     from ui.app import (
-        SHIFT_HOURS_LOOKUP_FALLBACK,
-        _apply_volume_change,
         _machine_overrides_from_engine,
         app,
+    )
+    from ui.volume_change import (
+        SHIFT_HOURS_LOOKUP_FALLBACK,
+        apply_volume_change as _apply_volume_change,
     )
     from ui.routes.machines import create_machines_blueprint
 
@@ -427,11 +429,13 @@ def test_replay_matches_live_edits(golden_fixture_path):
     from modules.planning_engine import PlanningEngine
     from ui.app import (
         _apply_machine_overrides,
-        _apply_volume_change,
-        _recalculate_capacity_and_values,
         app,
     )
     from ui.replay import replay_pending_edits
+    from ui.volume_change import (
+        apply_volume_change as _apply_volume_change,
+        recalculate_capacity_and_values as _recalculate_capacity_and_values,
+    )
 
     # --- Build engine A ---------------------------------------------------
     engine_a = PlanningEngine(
