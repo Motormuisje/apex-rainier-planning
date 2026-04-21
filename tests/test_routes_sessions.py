@@ -1,3 +1,6 @@
+from unittest.mock import patch
+
+
 def _flatten_session_groups(payload):
     sessions = []
     for group_sessions in payload["groups"].values():
@@ -144,3 +147,31 @@ def test_sessions_list_returns_all_sessions_with_metadata(
     assert listed["session-b"]["metadata"]["periods"] == 6
     assert listed["session-b"]["calculated"] is True
     assert listed["session-b"]["active"] is False
+
+
+def test_sessions_snapshot_deepcopy_failure_returns_500_without_saving(
+    session_route_app,
+    planning_engine_result,
+):
+    session_route_app.make_session(
+        "session-a",
+        engine=planning_engine_result,
+        custom_name="Session A",
+    )
+    session_route_app.set_active_session_id("session-a")
+
+    with patch(
+        "ui.routes.sessions.copy.deepcopy",
+        side_effect=RuntimeError("deepcopy failed"),
+    ):
+        response = session_route_app.client.post(
+            "/api/sessions/snapshot",
+            json={"name": "Broken snapshot"},
+        )
+
+    assert response.status_code == 500
+    payload = response.get_json()
+    assert payload["success"] is False
+    assert payload["error"] == "Could not copy session state: deepcopy failed"
+    assert set(session_route_app.sessions) == {"session-a"}
+    assert not session_route_app.save_calls

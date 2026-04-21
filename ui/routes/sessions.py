@@ -41,10 +41,12 @@ def create_sessions_blueprint(
             return jsonify({'error': 'No active session'}), 400
 
         new_id = str(uuid.uuid4())
-        try:
-            engine_copy = copy.deepcopy(sess.get('engine')) if sess.get('engine') is not None else None
-        except Exception:
-            engine_copy = None
+        engine_copy = None
+        if sess.get('engine') is not None:
+            try:
+                engine_copy = copy.deepcopy(sess['engine'])
+            except Exception as exc:
+                return jsonify({'success': False, 'error': f'Could not copy session state: {exc}'}), 500
         new_sess = {
             'id': new_id,
             'file_path': sess.get('file_path', ''),
