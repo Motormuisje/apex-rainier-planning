@@ -15,7 +15,7 @@ def _apply_edit_highlights(path: str, engine):
     from openpyxl.styles import PatternFill, Font
     from openpyxl.comments import Comment
 
-    # Collect all edit
+    # Collect all edits
     all_edits = []
     for _, rows in engine.results.items():
         for row in rows:
