@@ -133,6 +133,7 @@ def scenarios_route_app(tmp_path):
         scenarios=scenarios,
         sessions=sessions,
         engine=engine,
+        export_dir=tmp_path / "exports",
     )
 
 
@@ -173,6 +174,23 @@ def test_save_scenario_snapshots_current_engine(scenarios_route_app):
     assert saved["pending_edits"]
     assert saved["valuation_params"] == {"1": 1.0}
     assert saved["purchased_and_produced"] == "MAT-1:0.25"
+
+
+def test_save_scenario_persists_to_scenario_store(scenarios_route_app):
+    scenarios_route_app.sessions["session-a"]["pending_edits"] = {
+        "03. Total demand||MAT-1||||2025-12": {"original": 9.0, "new_value": 10.0},
+    }
+
+    response = scenarios_route_app.client.post("/api/scenarios/save", json={"name": "Stored"})
+
+    assert response.status_code == 200, response.get_json(silent=True)
+    scenario_id = response.get_json()["scenario_id"]
+    assert scenario_id in scenarios_route_app.scenarios
+    stored = scenarios_route_app.scenarios[scenario_id]
+    assert stored["name"] == "Stored"
+    assert stored["pending_edits"] == {
+        "03. Total demand||MAT-1||||2025-12": {"original": 9.0, "new_value": 10.0},
+    }
 
 
 def test_save_scenario_requires_name(scenarios_route_app):
@@ -217,6 +235,35 @@ def test_load_scenario_restores_snapshots_and_session_state(scenarios_route_app)
     assert scenarios_route_app.engine.results[LineType.TOTAL_DEMAND.value][0].material_number == "MAT-9"
     assert scenarios_route_app.engine.all_production_plans == {}
     assert scenarios_route_app.engine.all_purchase_receipts == {}
+
+
+def test_load_scenario_restores_session_state_with_derived_pending_edits(scenarios_route_app):
+    restored_row = _row(
+        "MAT-7",
+        LineType.TOTAL_DEMAND.value,
+        {"2025-12": 33.0},
+        manual_edits={"2025-12": {"original": 30.0, "new": 33.0}},
+    )
+    scenarios_route_app.scenarios["scenario-derived"] = _scenario(
+        "session-a",
+        "Derived",
+        results={LineType.TOTAL_DEMAND.value: [_snapshot(restored_row)]},
+        pending_edits={},
+        value_aux_overrides={"aux-key": {"original": 1.0, "new_value": 2.0}},
+    )
+
+    response = scenarios_route_app.client.post(
+        "/api/scenarios/load",
+        json={"scenario_id": "scenario-derived"},
+    )
+
+    assert response.status_code == 200, response.get_json(silent=True)
+    assert scenarios_route_app.sessions["session-a"]["pending_edits"] == {
+        "03. Total demand||MAT-7||||2025-12": {"original": 30.0, "new_value": 33.0},
+    }
+    assert scenarios_route_app.sessions["session-a"]["value_aux_overrides"] == {
+        "aux-key": {"original": 1.0, "new_value": 2.0},
+    }
 
 
 def test_load_scenario_returns_404_for_missing_id(scenarios_route_app):
@@ -283,6 +330,31 @@ def test_compare_scenarios_returns_summary_and_diff_rows(scenarios_route_app):
     assert len(payload["rows"]) == 2
 
 
+def test_compare_scenarios_export_returns_xlsx(scenarios_route_app):
+    row_a = _row("MAT-1", LineType.TOTAL_DEMAND.value, {"2025-12": 10.0})
+    row_b = _row("MAT-1", LineType.TOTAL_DEMAND.value, {"2025-12": 8.0})
+    val_a = _row("REV", LineType.CONSOLIDATION.value, {"2025-12": 100.0})
+    val_b = _row("REV", LineType.CONSOLIDATION.value, {"2025-12": 75.0})
+    scenarios_route_app.scenarios["a"] = _scenario(
+        "session-a",
+        "Scenario A",
+        results={LineType.TOTAL_DEMAND.value: [_snapshot(row_a)]},
+        value_results={LineType.CONSOLIDATION.value: [_snapshot(val_a)]},
+    )
+    scenarios_route_app.scenarios["b"] = _scenario(
+        "session-a",
+        "Scenario B",
+        results={LineType.TOTAL_DEMAND.value: [_snapshot(row_b)]},
+        value_results={LineType.CONSOLIDATION.value: [_snapshot(val_b)]},
+    )
+
+    response = scenarios_route_app.client.get("/api/scenarios/compare/export?a=a&b=b")
+
+    assert response.status_code == 200, response.get_json(silent=True)
+    assert response.headers["Content-Disposition"].startswith("attachment;")
+    assert 'filename="Comparison_Scenario A_vs_Scenario B.xlsx"' in response.headers["Content-Disposition"]
+
+
 def test_compare_scenarios_returns_404_for_missing_id(scenarios_route_app):
     response = scenarios_route_app.client.post(
         "/api/scenarios/compare",
@@ -293,6 +365,22 @@ def test_compare_scenarios_returns_404_for_missing_id(scenarios_route_app):
     assert response.get_json()["error"] == "Scenario not found"
 
 
-@pytest.mark.skip(reason="GET /api/scenarios/compare/export writes and returns a binary .xlsx file.")
-def test_scenario_compare_export_skipped_by_design(scenarios_route_app):
-    scenarios_route_app.client.get("/api/scenarios/compare/export")
+def test_scenario_compare_export_writes_file_to_export_dir(scenarios_route_app):
+    row_a = _row("MAT-1", LineType.TOTAL_DEMAND.value, {"2025-12": 10.0})
+    row_b = _row("MAT-1", LineType.TOTAL_DEMAND.value, {"2025-12": 8.0})
+    scenarios_route_app.scenarios["a"] = _scenario(
+        "session-a",
+        "Scenario A",
+        results={LineType.TOTAL_DEMAND.value: [_snapshot(row_a)]},
+    )
+    scenarios_route_app.scenarios["b"] = _scenario(
+        "session-a",
+        "Scenario B",
+        results={LineType.TOTAL_DEMAND.value: [_snapshot(row_b)]},
+    )
+
+    response = scenarios_route_app.client.get("/api/scenarios/compare/export?a=a&b=b")
+
+    assert response.status_code == 200, response.get_json(silent=True)
+    export_path = scenarios_route_app.export_dir / "Comparison_Scenario A_vs_Scenario B.xlsx"
+    assert export_path.exists()
