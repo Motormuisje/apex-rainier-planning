@@ -270,6 +270,8 @@ def recalculate_capacity_and_values(current_engine, sess):
     cap_results = cap_eng.calculate()
     for lt, cap_rows in cap_results.items():
         current_engine.results[lt] = cap_rows
+    if hasattr(current_engine, 'rebuild_machine_output_caches'):
+        current_engine.rebuild_machine_output_caches()
     recalculate_value_results(current_engine, sess)
 
 def apply_volume_change(sess, current_engine, line_type, material_number, period, new_value,

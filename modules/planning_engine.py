@@ -70,6 +70,8 @@ class PlanningEngine:
         self.all_purchase_receipts: Dict[str, Dict[str, float]] = {}
         self.all_total_demands: Dict[str, Dict[str, float]] = {}
         self.all_purch_raw_needs: Dict[str, Dict[str, float]] = {}
+        self.machine_throughput_theo: Dict[str, float] = {}
+        self.output_by_machine_period: Dict[str, Dict[str, float]] = {}
         
         # Value planning (NEW)
         self.value_results: Dict[str, List[PlanningRow]] = {}
@@ -332,6 +334,7 @@ class PlanningEngine:
         capacity_results = capacity_engine.calculate()
         for line_type, rows in capacity_results.items():
             self.results[line_type] = rows
+        self.rebuild_machine_output_caches()
         
         # ===== STEP 6: Value planning calculations =====
         print("\n[STEP 6] Calculating value planning...")
@@ -349,6 +352,49 @@ class PlanningEngine:
         self._print_summary()
 
         return self
+
+    def rebuild_machine_output_caches(self) -> None:
+        """Precompute per-machine throughput data used by the machines route."""
+        if self.data is None:
+            self.machine_throughput_theo = {}
+            self.output_by_machine_period = {}
+            return
+
+        periods = self.data.periods
+
+        theo_lists = {}
+        for mat_num in list(self.data.materials.keys()):
+            try:
+                routings = self.data.get_all_routings(mat_num)
+            except Exception:
+                continue
+            for routing in routings:
+                wc = routing.work_center
+                if routing.base_quantity > 0 and routing.standard_time > 0:
+                    theo_lists.setdefault(wc, []).append(routing.base_quantity / routing.standard_time)
+        self.machine_throughput_theo = {
+            wc: sum(values) / len(values) if values else 0.0
+            for wc, values in theo_lists.items()
+        }
+
+        output_by_machine_period = {
+            mc: {period: 0.0 for period in periods}
+            for mc in self.data.machines
+        }
+        for mat_num, plan_data in self.all_production_plans.items():
+            try:
+                routings = self.data.get_all_routings(mat_num)
+            except Exception:
+                continue
+            for routing in routings:
+                wc = routing.work_center
+                if wc not in output_by_machine_period:
+                    continue
+                for period in periods:
+                    qty = plan_data.get(period, 0.0)
+                    if qty > 0:
+                        output_by_machine_period[wc][period] += qty
+        self.output_by_machine_period = output_by_machine_period
 
     def _compile_all_rows(self):
         self.all_rows = []

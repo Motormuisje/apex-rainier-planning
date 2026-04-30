@@ -240,6 +240,29 @@ def test_get_machines_returns_computed_shift_hours(machines_route_app):
     assert machine["edit_meta"]["shift_hours"]["new_display"] == "612.5h"
 
 
+def test_get_machines_uses_precomputed_machine_output_cache(machines_route_app):
+    machines_route_app.engine.machine_throughput_theo = {"M1": 42.0}
+    machines_route_app.engine.output_by_machine_period = {
+        "M1": {"2025-12": 420.0, "2026-01": 1000.0},
+    }
+
+    def fail_if_called(material_number):
+        raise AssertionError("route should not recompute routings when engine cache is present")
+
+    machines_route_app.engine.data.get_all_routings = fail_if_called
+
+    response = machines_route_app.client.get("/api/machines")
+
+    assert response.status_code == 200, response.get_json(silent=True)
+    payload = response.get_json()
+    machine = payload["machines"][0]
+    assert machine["throughput_theoretical"] == pytest.approx(42.0)
+    assert machine["throughput_effective_by_period"] == {
+        "2025-12": 42.0,
+        "2026-01": 50.0,
+    }
+
+
 def test_reset_machine_params_without_baseline_returns_400(machines_route_app):
     machines_route_app.sess["reset_baseline"] = {}
 

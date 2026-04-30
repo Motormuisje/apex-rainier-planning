@@ -5037,8 +5037,8 @@ async function refreshAllTabs() {
     state.dashboardDirty = false;
 }
 
-async function _refreshDerivedViews({ forceDashboard = false, refreshCapacity = true, refreshInventory = true } = {}) {
-    if (forceDashboard || state.dashboardDirty) {
+async function _refreshDerivedViews({ forceDashboard = false, refreshCapacity = true, refreshInventory = true, skipDashboard = false } = {}) {
+    if (!skipDashboard && (forceDashboard || state.dashboardDirty)) {
         await renderDashboard();
         state.dashboardDirty = false;
     }
@@ -5046,7 +5046,7 @@ async function _refreshDerivedViews({ forceDashboard = false, refreshCapacity = 
     if (refreshInventory) loadInventoryData();
 }
 
-async function _applyServerPayload(data, { prevValueSnapshot = null, deltaSource = 'config', skipDeltaRecording = false } = {}) {
+async function _applyServerPayload(data, { prevValueSnapshot = null, deltaSource = 'config', skipDeltaRecording = false, skipDashboard = false } = {}) {
     const hasPlanning = !!data.results;
     const hasValues = !!data.value_results;
 
@@ -5079,11 +5079,12 @@ async function _applyServerPayload(data, { prevValueSnapshot = null, deltaSource
 
     if (hasPlanning || hasValues) {
         updateEditBadge();
-        state.dashboardDirty = true;
+        if (!skipDashboard) state.dashboardDirty = true;
         await _refreshDerivedViews({
-            forceDashboard: true,
+            forceDashboard: !skipDashboard,
             refreshCapacity: hasPlanning,
             refreshInventory: hasPlanning,
+            skipDashboard,
         });
     }
 }
@@ -6275,6 +6276,7 @@ let _machinesData = null;
 let _machinesUndoDepth = 0;
 let _machinesRedoDepth = 0;
 let _machineEditMode = false;
+let _machineOpInFlight = false;
 let _machSlotCharts = [null, null];
 let _machDashChartRetries = new Set();
 
@@ -6962,6 +6964,10 @@ function escapeHtml(s) {
 }
 
 async function saveMachineEdit(td) {
+    if (_machineOpInFlight) {
+        td.textContent = td.dataset.currentDisplay || td.dataset._orig || '';
+        return;
+    }
     const mc = td.dataset.mc;
     const field = td.dataset.field;
     const raw = (td.textContent || '').trim().replace('%', '').replace(',', '.');
@@ -6983,6 +6989,7 @@ async function saveMachineEdit(td) {
     }
 
     td.classList.add('opacity-50');
+    _machineOpInFlight = true;
     const beforeImpact = _snapshotMachineImpactState();
     const fieldUnit = field === 'shift_hours' ? 'h' : '%';
     const fieldLabel = field === 'oee' ? 'OEE' : field === 'shift_hours' ? 'Shift-uren' : 'Availability';
@@ -7010,17 +7017,21 @@ async function saveMachineEdit(td) {
         _machinesRedoDepth = out.redo_depth || 0;
         _updateMachineButtons();
         _buildMachineDeltaSummary(beforeImpact, out, [directChange]);
-        await _applyServerPayload(out, { deltaSource: 'plan', skipDeltaRecording: true });
+        await _applyServerPayload(out, { deltaSource: 'plan', skipDeltaRecording: true, skipDashboard: true });
+        await loadMachinesData();
     } catch (err) {
         log('Machine update failed: ' + err);
         td.textContent = td.dataset.currentDisplay || '';
     } finally {
+        _machineOpInFlight = false;
         td.classList.remove('opacity-50');
     }
 }
 
 async function undoMachineEdit() {
+    if (_machineOpInFlight) return;
     if (_machinesUndoDepth === 0) return;
+    _machineOpInFlight = true;
     try {
         const beforeImpact = _snapshotMachineImpactState();
         const res = await fetch('/api/machines/undo', { method: 'POST' });
@@ -7040,12 +7051,16 @@ async function undoMachineEdit() {
                 : 'hersteld',
         };
         _buildMachineDeltaSummary(beforeImpact, out, [directChange]);
-        await _applyServerPayload(out, { deltaSource: 'plan', skipDeltaRecording: true });
+        await _applyServerPayload(out, { deltaSource: 'plan', skipDeltaRecording: true, skipDashboard: true });
+        await loadMachinesData();
     } catch (err) { log('Undo failed: ' + err); }
+    finally { _machineOpInFlight = false; }
 }
 
 async function redoMachineEdit() {
+    if (_machineOpInFlight) return;
     if (_machinesRedoDepth === 0) return;
+    _machineOpInFlight = true;
     try {
         const beforeImpact = _snapshotMachineImpactState();
         const res = await fetch('/api/machines/redo', { method: 'POST' });
@@ -7066,8 +7081,10 @@ async function redoMachineEdit() {
                 : 'hersteld',
         };
         _buildMachineDeltaSummary(beforeImpact, out, [directChange]);
-        await _applyServerPayload(out, { deltaSource: 'plan', skipDeltaRecording: true });
+        await _applyServerPayload(out, { deltaSource: 'plan', skipDeltaRecording: true, skipDashboard: true });
+        await loadMachinesData();
     } catch (err) { log('Redo failed: ' + err); }
+    finally { _machineOpInFlight = false; }
 }
 
 async function resetMachineEdits() {
@@ -7087,7 +7104,8 @@ async function resetMachineEdits() {
             old_display: 'huidige waarden',
             new_display: 'laatste Calculate',
         }]);
-        await _applyServerPayload(out, { deltaSource: 'plan', skipDeltaRecording: true });
+        await _applyServerPayload(out, { deltaSource: 'plan', skipDeltaRecording: true, skipDashboard: true });
+        await loadMachinesData();
     } catch (err) { log('Machine reset failed: ' + err); }
 }
 async function loadInventoryData() {

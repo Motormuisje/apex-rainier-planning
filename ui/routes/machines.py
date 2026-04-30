@@ -109,35 +109,44 @@ def create_machines_blueprint(
         fte_rows = current_engine.results.get(LineType.FTE_REQUIREMENTS.value, [])
         fte_by_group = {row.material_number: row.values for row in fte_rows}
 
-        machine_throughput_theo = {}
-        theo_lists = {}
-        for mat_num in list(data.materials.keys()):
-            try:
-                routings = data.get_all_routings(mat_num)
-            except Exception:
-                continue
-            for routing in routings:
-                wc = routing.work_center
-                if routing.base_quantity > 0 and routing.standard_time > 0:
-                    theo_lists.setdefault(wc, []).append(routing.base_quantity / routing.standard_time)
-        for wc, values in theo_lists.items():
-            machine_throughput_theo[wc] = sum(values) / len(values) if values else 0.0
+        if not hasattr(current_engine, 'machine_throughput_theo') or not hasattr(current_engine, 'output_by_machine_period'):
+            if hasattr(current_engine, 'rebuild_machine_output_caches'):
+                current_engine.rebuild_machine_output_caches()
+            else:
+                machine_throughput_theo = {}
+                theo_lists = {}
+                for mat_num in list(data.materials.keys()):
+                    try:
+                        routings = data.get_all_routings(mat_num)
+                    except Exception:
+                        continue
+                    for routing in routings:
+                        wc = routing.work_center
+                        if routing.base_quantity > 0 and routing.standard_time > 0:
+                            theo_lists.setdefault(wc, []).append(routing.base_quantity / routing.standard_time)
+                for wc, values in theo_lists.items():
+                    machine_throughput_theo[wc] = sum(values) / len(values) if values else 0.0
 
-        prod_plan = current_engine.all_production_plans if hasattr(current_engine, 'all_production_plans') else {}
-        output_by_machine_period = {mc: {period: 0.0 for period in periods} for mc in data.machines}
-        for mat_num, plan_data in prod_plan.items():
-            try:
-                routings = data.get_all_routings(mat_num)
-            except Exception:
-                continue
-            for routing in routings:
-                wc = routing.work_center
-                if wc not in output_by_machine_period:
-                    continue
-                for period in periods:
-                    qty = plan_data.get(period, 0.0)
-                    if qty > 0:
-                        output_by_machine_period[wc][period] += qty
+                prod_plan = current_engine.all_production_plans if hasattr(current_engine, 'all_production_plans') else {}
+                output_by_machine_period = {mc: {period: 0.0 for period in periods} for mc in data.machines}
+                for mat_num, plan_data in prod_plan.items():
+                    try:
+                        routings = data.get_all_routings(mat_num)
+                    except Exception:
+                        continue
+                    for routing in routings:
+                        wc = routing.work_center
+                        if wc not in output_by_machine_period:
+                            continue
+                        for period in periods:
+                            qty = plan_data.get(period, 0.0)
+                            if qty > 0:
+                                output_by_machine_period[wc][period] += qty
+                current_engine.machine_throughput_theo = machine_throughput_theo
+                current_engine.output_by_machine_period = output_by_machine_period
+
+        machine_throughput_theo = getattr(current_engine, 'machine_throughput_theo', {}) or {}
+        output_by_machine_period = getattr(current_engine, 'output_by_machine_period', {}) or {}
 
         def _effective_throughput_period(mc_code):
             out_p = output_by_machine_period.get(mc_code, {})
