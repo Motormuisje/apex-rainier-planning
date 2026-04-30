@@ -64,7 +64,7 @@ class FakeExportEngine(FakeMoMEngine):
 
 
 @pytest.fixture
-def exports_route_app(tmp_path):
+def exports_route_app(tmp_path, monkeypatch):
     active = {"engine": None}
     state = {
         "cycle_manager": FakeCycleManager(),
@@ -74,13 +74,18 @@ def exports_route_app(tmp_path):
     def get_active():
         return {"id": "exports-session"}, active["engine"]
 
+    monkeypatch.setattr(
+        exports_module,
+        "_apply_edit_highlights",
+        lambda path, engine: state["highlights"].append((path, engine)),
+    )
+
     flask_app = Flask(__name__)
     flask_app.config["TESTING"] = True
     flask_app.register_blueprint(create_exports_blueprint(
         get_active,
         lambda: tmp_path / "exports",
         lambda: state["cycle_manager"],
-        lambda path, engine: state["highlights"].append((path, engine)),
     ))
 
     return SimpleNamespace(
