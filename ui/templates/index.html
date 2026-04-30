@@ -6277,8 +6277,18 @@ let _machinesUndoDepth = 0;
 let _machinesRedoDepth = 0;
 let _machineEditMode = false;
 let _machineOpInFlight = false;
+let _machineResetInFlight = false;
 let _machSlotCharts = [null, null];
 let _machDashChartRetries = new Set();
+
+async function _waitForMachineOpIdle(maxMs = 5000) {
+    const started = Date.now();
+    while (_machineOpInFlight) {
+        if (Date.now() - started > maxMs) return false;
+        await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    return true;
+}
 
 function _updateMachineButtons() {
     const undoBtn = document.getElementById('machinesUndoBtn');
@@ -6883,6 +6893,8 @@ function _removeDragPanel() {
 
 async function _applyDragChanges() {
     if (!_pendingDragApply) return;
+    if (_machineOpInFlight) return;
+    _machineOpInFlight = true;
     const { changes } = _pendingDragApply;
     const beforeImpact = _snapshotMachineImpactState();
     const directChanges = changes.map(c => ({
@@ -6893,27 +6905,32 @@ async function _applyDragChanges() {
         new_display: c.newOee.toFixed(1) + '%',
     }));
     _removeDragPanel();
-    let latest = null;
-    for (const c of changes) {
-        const res = await fetch('/api/machines/update', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ machine: c.code, field: 'oee', value: c.newOee / 100 })
-        });
-        latest = await res.json();
-        if (!res.ok) {
-            log('Machine update error: ' + (latest.error || res.status));
-            break;
+    try {
+        let latest = null;
+        for (const c of changes) {
+            const res = await fetch('/api/machines/update', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ machine: c.code, field: 'oee', value: c.newOee / 100 })
+            });
+            latest = await res.json();
+            if (!res.ok) {
+                log('Machine update error: ' + (latest.error || res.status));
+                break;
+            }
         }
-    }
-    if (latest && latest.success) {
-        _buildMachineDeltaSummary(beforeImpact, latest, directChanges);
-        await _applyServerPayload(latest, { deltaSource: 'plan', skipDeltaRecording: true });
-        _machinesUndoDepth = latest.undo_depth || 0;
-        _machinesRedoDepth = latest.redo_depth || 0;
-        _updateMachineButtons();
-    } else {
-        await _refreshDerivedViews({ forceDashboard: true, refreshCapacity: true, refreshInventory: false });
+        if (latest && latest.success) {
+            _buildMachineDeltaSummary(beforeImpact, latest, directChanges);
+            await _applyServerPayload(latest, { deltaSource: 'plan', skipDeltaRecording: true, skipDashboard: true });
+            _machinesUndoDepth = latest.undo_depth || 0;
+            _machinesRedoDepth = latest.redo_depth || 0;
+            _updateMachineButtons();
+            await loadMachinesData();
+        } else {
+            await _refreshDerivedViews({ forceDashboard: true, refreshCapacity: true, refreshInventory: false });
+        }
+    } finally {
+        _machineOpInFlight = false;
     }
 }
 
@@ -7088,7 +7105,19 @@ async function redoMachineEdit() {
 }
 
 async function resetMachineEdits() {
-    if (!confirm('Alle OEE/availability wijzigingen terugzetten naar de laatste Calculate-waarden?')) return;
+    if (_machineResetInFlight) return;
+    _machineResetInFlight = true;
+    const idle = await _waitForMachineOpIdle();
+    if (!idle) {
+        log('Machine reset skipped: another machine update is still running.');
+        _machineResetInFlight = false;
+        return;
+    }
+    if (!confirm('Alle OEE/availability wijzigingen terugzetten naar de laatste Calculate-waarden?')) {
+        _machineResetInFlight = false;
+        return;
+    }
+    _machineOpInFlight = true;
     try {
         const beforeImpact = _snapshotMachineImpactState();
         const res = await fetch('/api/machines/reset', { method: 'POST' });
@@ -7107,6 +7136,10 @@ async function resetMachineEdits() {
         await _applyServerPayload(out, { deltaSource: 'plan', skipDeltaRecording: true, skipDashboard: true });
         await loadMachinesData();
     } catch (err) { log('Machine reset failed: ' + err); }
+    finally {
+        _machineOpInFlight = false;
+        _machineResetInFlight = false;
+    }
 }
 async function loadInventoryData() {
     try {

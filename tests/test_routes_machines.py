@@ -137,7 +137,17 @@ def test_get_machines_returns_list_with_overrides(machines_route_app):
 
 
 def test_reset_machine_params_clears_overrides(machines_route_app):
-    machines_route_app.sess["machine_overrides"] = {"M1": {"oee": 0.85}}
+    machine = machines_route_app.engine.data.machines["M1"]
+    machine.oee = 0.85
+    machine.availability_by_period = {"2025-12": 0.70, "2026-01": 0.70}
+    machine.shift_hours_override = 640.0
+    machines_route_app.sess["machine_overrides"] = {
+        "M1": {
+            "oee": 0.85,
+            "availability_by_period": {"2025-12": 0.70, "2026-01": 0.70},
+            "shift_hours_override": 640.0,
+        },
+    }
     machines_route_app.sess["machine_undo"] = [{"machine": "M1"}]
     machines_route_app.sess["machine_redo"] = [{"machine": "M1"}]
 
@@ -148,7 +158,9 @@ def test_reset_machine_params_clears_overrides(machines_route_app):
     assert machines_route_app.sess["machine_overrides"] == {}
     assert machines_route_app.sess["machine_undo"] == []
     assert machines_route_app.sess["machine_redo"] == []
-    assert machines_route_app.engine.data.machines["M1"].oee == pytest.approx(0.80)
+    assert machine.oee == pytest.approx(0.80)
+    assert machine.availability_by_period == {"2025-12": 0.90, "2026-01": 0.90}
+    assert machine.shift_hours_override is None
     assert machines_route_app.recalc_calls == [(machines_route_app.engine, machines_route_app.sess)]
     assert machines_route_app.save_calls == [True]
 
