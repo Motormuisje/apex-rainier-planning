@@ -25,6 +25,10 @@ from ui.config_store import (
     save_global_config,
     sync_global_config_from_engine,
 )
+from ui.cascade import (
+    finish_pap_recalc as _finish_pap_recalc_impl,
+    recalc_pap_material as _recalc_pap_material_impl,
+)
 from ui.errors import classify_upload_exception as _classify_upload_exception
 from ui.replay import (
     recalculate_value_results,
@@ -485,41 +489,11 @@ def _apply_edit_highlights(path: str, engine):
 # ---- Prod/Purch Split endpoints ----
 
 def _recalc_pap_material(current_engine, material_number):
-    """Re-run inventory + full BOM cascade for a PAP material change.
-    Uses BFS so every child (and grandchild, etc.) gets its inventory recalculated
-    after its dependent demand is updated â€” not just L02/L03."""
-    from modules.inventory_engine import InventoryEngine
-    from modules.bom_engine import BOMEngine
-
-    inv_eng = InventoryEngine(current_engine.data)
-    bom_eng = BOMEngine(current_engine.data)
-    periods_list = current_engine.data.periods
-
-    # Recalculate the PAP material itself (override_forecast keeps the PAP split intact)
-    children_demand = recalc_one_material(
-        current_engine, material_number, inv_eng, bom_eng, periods_list,
-        override_forecast=True,
-    )
-
-    # BFS: recalculate every affected child's inventory so the cascade is complete
-    queue = list(children_demand.keys())
-    visited = {material_number}
-    while queue:
-        child_mat = queue.pop(0)
-        if child_mat in visited:
-            continue
-        visited.add(child_mat)
-        grandchildren_demand = recalc_one_material(
-            current_engine, child_mat, inv_eng, bom_eng, periods_list,
-            override_forecast=False,
-        )
-        queue.extend(gc for gc in grandchildren_demand if gc not in visited)
-
+    _recalc_pap_material_impl(current_engine, material_number, recalc_one_material)
 
 def _finish_pap_recalc(current_engine):
-    """Run capacity + value engines after a PAP fraction change."""
     sess = sessions.get(active_session_id) if active_session_id else None
-    recalculate_capacity_and_values(current_engine, sess)
+    _finish_pap_recalc_impl(current_engine, sess, recalculate_capacity_and_values)
 
 
 _SESSION_SAVE_PATHS = {
