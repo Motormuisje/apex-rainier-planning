@@ -6,6 +6,7 @@ from flask import Flask, jsonify
 
 from modules.models import LineType, PlanningRow
 from ui.state_snapshot import snapshot_engine_state
+from ui.volume_change import apply_volume_change
 
 
 def _mock_planning_row(line_type, aux_column=None):
@@ -293,6 +294,49 @@ def test_edits_persist_writes_and_removes_pending_edit_without_disk(edit_route_a
     assert response.get_json() == {"success": True}
     assert key not in sess["pending_edits"]
     assert len(edit_route_app.save_calls) == 2
+
+
+def test_live_edit_and_persist_use_one_pending_edit_key(edit_route_app):
+    sess = edit_route_app.make_session()
+    engine = sess["engine"]
+    row = _first_result_row(engine, LineType.DEMAND_FORECAST.value)
+    period = _first_period(row)
+    old_value = float(row.get_value(period))
+    new_value = old_value + 10.0
+    aux_column = str(getattr(row, "aux_column", "") or "").strip()
+
+    with edit_route_app.app.app_context():
+        response = apply_volume_change(
+            sess,
+            engine,
+            LineType.DEMAND_FORECAST.value,
+            row.material_number,
+            period,
+            new_value,
+            aux_column=aux_column,
+        )
+
+    assert response.status_code == 200, response.get_json(silent=True)
+    canonical_key = f"{LineType.DEMAND_FORECAST.value}||{row.material_number}||{aux_column}||{period}"
+    assert list(sess["pending_edits"]) == [canonical_key]
+
+    drifted_key = f"{LineType.DEMAND_FORECAST.value}||{row.material_number}|| {aux_column} ||{period}"
+    response = edit_route_app.client.post(
+        "/api/sessions/edits/persist",
+        json={
+            "session_id": sess["id"],
+            "key": drifted_key,
+            "original": old_value,
+            "new_value": new_value,
+        },
+    )
+
+    assert response.status_code == 200, response.get_json(silent=True)
+    assert list(sess["pending_edits"]) == [canonical_key]
+    assert sess["pending_edits"][canonical_key] == {
+        "original": pytest.approx(old_value),
+        "new_value": pytest.approx(new_value),
+    }
 
 
 @pytest.mark.no_fixture

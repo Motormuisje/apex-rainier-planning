@@ -3,6 +3,7 @@
 from flask import jsonify
 
 from modules.models import LineType
+from ui.pending_edits import pending_edit_key
 from ui.replay import recalculate_value_results
 from ui.state_snapshot import ensure_reset_baseline
 
@@ -340,7 +341,7 @@ def apply_volume_change(sess, current_engine, line_type, material_number, period
 
     # Keep pending_edits in sync server-side so the edit survives a server restart
     # without needing the frontend's separate /api/sessions/edits/persist call.
-    _edit_key = f"{line_type}||{material_number}||{aux_column}||{period}"
+    _edit_key = pending_edit_key(line_type, material_number, aux_column, period)
     _pending = sess.setdefault('pending_edits', {})
     if new_value == original_val:
         _pending.pop(_edit_key, None)

@@ -2,6 +2,8 @@
 
 from flask import Blueprint, jsonify, request
 
+from ui.pending_edits import canonical_pending_edit_key
+
 
 def create_edit_state_blueprint(
     sessions: dict,
@@ -21,7 +23,7 @@ def create_edit_state_blueprint(
         session_id = req.get('session_id', '')
         if not session_id or session_id not in sessions:
             return jsonify({'error': 'Session not found'}), 404
-        key = req.get('key', '').strip()
+        key = canonical_pending_edit_key(req.get('key', ''))
         if not key:
             return jsonify({'error': 'Cell key required'}), 400
         original = float(req.get('original', 0))
