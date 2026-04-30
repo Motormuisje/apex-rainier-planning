@@ -28,6 +28,9 @@ def create_sessions_blueprint(
 ) -> Blueprint:
     bp = Blueprint('sessions', __name__)
 
+    def _session_is_calculated(sess: dict) -> bool:
+        return sess.get('engine') is not None or sess.get('parameters') is not None
+
     @bp.route('/api/sessions/snapshot', methods=['POST'])
     def snapshot_session():
         """Duplicate the active session, including all edits, as a named instance."""
@@ -41,12 +44,6 @@ def create_sessions_blueprint(
             return jsonify({'error': 'No active session'}), 400
 
         new_id = str(uuid.uuid4())
-        engine_copy = None
-        if sess.get('engine') is not None:
-            try:
-                engine_copy = copy.deepcopy(sess['engine'])
-            except Exception as exc:
-                return jsonify({'success': False, 'error': f'Could not copy session state: {exc}'}), 500
         new_sess = {
             'id': new_id,
             'file_path': sess.get('file_path', ''),
@@ -54,13 +51,17 @@ def create_sessions_blueprint(
             'filename': sess.get('filename', ''),
             'custom_name': name,
             'is_snapshot': True,
-            'engine': engine_copy,
+            'engine': None,
             'value_results': copy.deepcopy(sess.get('value_results', {})),
             'metadata': copy.deepcopy(sess.get('metadata', {})),
             'uploaded_at': datetime.now().isoformat(),
             'parameters': copy.deepcopy(sess.get('parameters')),
             'pending_edits': copy.deepcopy(sess.get('pending_edits', {})),
             'value_aux_overrides': copy.deepcopy(sess.get('value_aux_overrides', {})),
+            'valuation_params': copy.deepcopy(
+                sess.get('valuation_params')
+                or (sess.get('reset_baseline') or {}).get('valuation_params')
+            ),
             'machine_overrides': (
                 machine_overrides_from_engine(sess, sess.get('engine'))
                 if sess.get('engine') is not None
@@ -85,7 +86,7 @@ def create_sessions_blueprint(
                 'site': site,
                 'planning_month': planning_month,
                 'uploaded_at': new_sess['uploaded_at'],
-                'calculated': engine_copy is not None,
+                'calculated': _session_is_calculated(new_sess),
                 'is_snapshot': True,
                 'active': False,
                 'metadata': meta,
@@ -112,7 +113,7 @@ def create_sessions_blueprint(
                 'site': site,
                 'planning_month': planning_month,
                 'uploaded_at': sess.get('uploaded_at', ''),
-                'calculated': sess.get('engine') is not None,
+                'calculated': _session_is_calculated(sess),
                 'is_snapshot': sess.get('is_snapshot', False),
                 'active': sid == active_session_id,
                 'metadata': meta,
@@ -142,7 +143,7 @@ def create_sessions_blueprint(
                 'metadata': sess.get('metadata', {}),
                 'uploaded_at': sess.get('uploaded_at', ''),
                 'planning_month': (sess.get('metadata') or {}).get('planning_month', ''),
-                'calculated': sess.get('engine') is not None,
+                'calculated': _session_is_calculated(sess),
             }
         })
 

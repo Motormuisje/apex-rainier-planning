@@ -1,5 +1,3 @@
-from unittest.mock import patch
-
 import pytest
 from types import SimpleNamespace
 
@@ -152,32 +150,33 @@ def test_sessions_list_returns_all_sessions_with_metadata(
     assert listed["session-b"]["active"] is False
 
 
-def test_sessions_snapshot_deepcopy_failure_returns_500_without_saving(
+def test_sessions_snapshot_does_not_deepcopy_engine_with_open_buffer(
     session_route_app,
     planning_engine_result,
 ):
-    session_route_app.make_session(
-        "session-a",
-        engine=planning_engine_result,
-        custom_name="Session A",
-    )
-    session_route_app.set_active_session_id("session-a")
+    with open(__file__, "rb") as file_handle:
+        planning_engine_result.open_buffer = file_handle
+        session_route_app.make_session(
+            "session-a",
+            engine=planning_engine_result,
+            custom_name="Session A",
+        )
+        session_route_app.set_active_session_id("session-a")
 
-    with patch(
-        "ui.routes.sessions.copy.deepcopy",
-        side_effect=RuntimeError("deepcopy failed"),
-    ):
         response = session_route_app.client.post(
             "/api/sessions/snapshot",
-            json={"name": "Broken snapshot"},
+            json={"name": "Buffered snapshot"},
         )
 
-    assert response.status_code == 500
+    assert response.status_code == 200, response.get_json(silent=True) or response.get_data(as_text=True)
     payload = response.get_json()
-    assert payload["success"] is False
-    assert payload["error"] == "Could not copy session state: deepcopy failed"
-    assert set(session_route_app.sessions) == {"session-a"}
-    assert not session_route_app.save_calls
+    assert payload["success"] is True
+    assert payload["session"]["calculated"] is True
+    new_id = payload["session"]["id"]
+    assert set(session_route_app.sessions) == {"session-a", new_id}
+    assert session_route_app.sessions[new_id]["engine"] is None
+    assert session_route_app.sessions[new_id]["parameters"] == session_route_app.sessions["session-a"]["parameters"]
+    assert session_route_app.save_calls
 
 
 def test_snapshot_with_engine_copies_pending_edits(
@@ -228,7 +227,8 @@ def test_snapshot_with_engine_copies_pending_edits(
     new_session = session_route_app.sessions[new_id]
     assert new_session["custom_name"] == "Snapshot A"
     assert new_session["is_snapshot"] is True
-    assert new_session["engine"] is not fake_engine
+    assert new_session["engine"] is None
+    assert payload["session"]["calculated"] is True
     assert new_session["pending_edits"] == {
         "01. Demand forecast||MAT-1||||2025-12": {
             "original": 10.0,
