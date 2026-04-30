@@ -1114,7 +1114,7 @@
                             <button id="machEditModeBtn" onclick="toggleMachineEditMode()" class="edit-mode-btn px-3 py-1 rounded text-xs border" style="background:rgba(180,130,0,0.18);color:#fcd34d;border-color:rgba(202,138,4,0.40);" title="Activeer bewerkingsmodus voor OEE, beschikbaarheid en shift-uren (Ctrl+E)">&#9998; Bewerken</button>
                             <button id="machinesUndoBtn"  onclick="undoMachineEdit()"  class="px-3 py-1 text-xs rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-40" disabled title="Maak de laatste machine-bewerking ongedaan (Ctrl+Z)">&#8630; Undo</button>
                             <button id="machinesRedoBtn"  onclick="redoMachineEdit()"  class="px-3 py-1 text-xs rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-40" disabled title="Herstel de laatste ongedaan gemaakte bewerking (Ctrl+Y)">&#8631; Redo</button>
-                            <button id="machinesResetBtn" onclick="resetMachineEdits()" class="px-3 py-1 text-xs rounded bg-slate-700 hover:bg-slate-600" title="Zet OEE en beschikbaarheid terug naar de waarden van de laatste Calculate">Reset</button>
+                            <button id="machinesResetBtn" onmousedown="event.preventDefault(); resetMachineEdits()" onclick="event.preventDefault()" class="px-3 py-1 text-xs rounded bg-slate-700 hover:bg-slate-600" title="Zet OEE en beschikbaarheid terug naar de waarden van de laatste Calculate">Reset</button>
                         </div>
                     </div>
                 </div>
@@ -7107,6 +7107,12 @@ async function redoMachineEdit() {
 async function resetMachineEdits() {
     if (_machineResetInFlight) return;
     _machineResetInFlight = true;
+    const active = document.querySelector('#oeeTableBody td.mach-edit[contenteditable="true"]');
+    if (active) {
+        active.textContent = active.dataset.currentDisplay || active.dataset._orig || '';
+        active.removeAttribute('contenteditable');
+        active.blur();
+    }
     const idle = await _waitForMachineOpIdle();
     if (!idle) {
         log('Machine reset skipped: another machine update is still running.');
