@@ -8,6 +8,13 @@ from tests.browser.test_edits import (
     _edit_first_demand_cell_to,
     _prepare_clean_planning_page,
 )
+from tests.browser.test_machines import (
+    _editable_machine_cell,
+    _enable_machine_edit_mode,
+    _expand_first_machine_group,
+    _open_machines_tab,
+    _reset_machines,
+)
 
 
 # Selector inventory:
@@ -227,6 +234,47 @@ def test_rename_session_updates_sidebar(browser_page, golden_fixture_path):
     finally:
         requests.delete(base_url + f"/api/sessions/{session_id}", timeout=30)
         _switch_to_session_via_api(base_url, browser_page.server["session_id"])
+
+
+def test_machine_delta_summary_is_scoped_per_session(browser_page, second_session):
+    base_url = browser_page.server["base_url"]
+    original_session_id = browser_page.server["session_id"]
+
+    _switch_to_session_via_api(base_url, original_session_id)
+    _reset_machines(base_url)
+    page = browser_page
+    page.reload(wait_until="networkidle")
+    _open_machines_tab(page)
+    _expand_first_machine_group(page)
+    _enable_machine_edit_mode(page)
+
+    oee_cell = _editable_machine_cell(page, "oee")
+    baseline_value = oee_cell.get_attribute("data-edit-value")
+    assert baseline_value
+    replacement = f"{max(1.0, float(baseline_value) * 0.5):.1f}"
+    oee_cell.click()
+    expect(oee_cell).to_have_attribute("contenteditable", "true")
+    oee_cell.fill(replacement)
+    with page.expect_response(lambda response: "/api/machines/update" in response.url and response.ok):
+        oee_cell.press("Enter")
+    page.wait_for_load_state("networkidle")
+
+    summary = page.locator("#machineDeltaSummary")
+    expect(summary).to_contain_text("OEE", timeout=60000)
+
+    page.evaluate(
+        "sessionId => window.switchSession(sessionId)",
+        second_session["session_id"],
+    )
+    page.wait_for_load_state("networkidle")
+    expect(summary).to_contain_text("Nog geen machinewijzigingen", timeout=60000)
+
+    page.evaluate(
+        "sessionId => window.switchSession(sessionId)",
+        original_session_id,
+    )
+    page.wait_for_load_state("networkidle")
+    expect(summary).to_contain_text("OEE", timeout=60000)
 
 
 def test_save_instance_reopens_with_pending_edit(browser_page):

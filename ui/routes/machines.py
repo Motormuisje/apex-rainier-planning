@@ -274,8 +274,8 @@ def create_machines_blueprint(
             machine.oee = new_value
             machine_overrides.setdefault(mc_code, {})['oee'] = float(new_value)
         elif field == 'availability':
-            if not (0 <= new_value <= 100):
-                return jsonify({'error': 'availability must be 0-100'}), 400
+            if not (0 <= new_value <= 150):
+                return jsonify({'error': 'availability must be 0-150'}), 400
             factor = new_value / 100.0
             old_map = dict(machine.availability_by_period or {})
             new_map = {period: factor for period in current_engine.data.periods}

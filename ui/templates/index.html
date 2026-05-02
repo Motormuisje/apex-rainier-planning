@@ -1114,7 +1114,7 @@
                             <button id="machEditModeBtn" onclick="toggleMachineEditMode()" class="edit-mode-btn px-3 py-1 rounded text-xs border" style="background:rgba(180,130,0,0.18);color:#fcd34d;border-color:rgba(202,138,4,0.40);" title="Activeer bewerkingsmodus voor OEE, beschikbaarheid en shift-uren (Ctrl+E)">&#9998; Bewerken</button>
                             <button id="machinesUndoBtn"  onclick="undoMachineEdit()"  class="px-3 py-1 text-xs rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-40" disabled title="Maak de laatste machine-bewerking ongedaan (Ctrl+Z)">&#8630; Undo</button>
                             <button id="machinesRedoBtn"  onclick="redoMachineEdit()"  class="px-3 py-1 text-xs rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-40" disabled title="Herstel de laatste ongedaan gemaakte bewerking (Ctrl+Y)">&#8631; Redo</button>
-                            <button id="machinesResetBtn" onmousedown="event.preventDefault(); resetMachineEdits()" onclick="event.preventDefault()" class="px-3 py-1 text-xs rounded bg-slate-700 hover:bg-slate-600" title="Zet OEE en beschikbaarheid terug naar de waarden van de laatste Calculate">Reset</button>
+                            <button id="machinesResetBtn" onmousedown="event.preventDefault(); resetMachineEdits()" onclick="event.preventDefault()" class="px-3 py-1 text-xs rounded bg-slate-700 hover:bg-slate-600" title="Zet OEE, beschikbaarheid en shift-uren terug naar de waarden van de laatste Calculate">Reset</button>
                         </div>
                     </div>
                 </div>
@@ -1451,7 +1451,7 @@
     <div id="ltInfoTooltip"></div>
 <script src="{{ url_for('static', filename='sop_planning.js') }}?v=20260412w"></script>
 <script>
-let state = { periods: [], results: null, lineTypes: [], valueResults: null, valueLineTypes: [], consolidation: [], cellEdits: {}, valueAuxEdits: {}, valueRowDeltas: {}, demandTurnoverDeltas: {}, top10Overstocks: [], activeSessionId: null, dashboardDirty: false, moqRawNeeds: {}, machineDeltaSummary: null };
+let state = { periods: [], results: null, lineTypes: [], valueResults: null, valueLineTypes: [], consolidation: [], cellEdits: {}, valueAuxEdits: {}, valueRowDeltas: {}, demandTurnoverDeltas: {}, top10Overstocks: [], activeSessionId: null, dashboardDirty: false, moqRawNeeds: {}, machineDeltaSummary: null, machineDeltaSummaries: {} };
 // Resize all Chart.js charts when window is restored from minimized state
 let _resizeTimer = null;
 window.addEventListener('resize', () => {
@@ -2231,8 +2231,7 @@ async function runCalc() {
     state.valueAuxEdits = {};
     state.valueRowDeltas = {};
     state.demandTurnoverDeltas = {};
-    state.machineDeltaSummary = null;
-    renderMachineDeltaSummary();
+    _setMachineDeltaSummary(null);
     updateEditBadge();
     log('Parameters: planning_month=' + planningMonth + ', months_actuals=' + monthsActuals + ', months_forecast=' + monthsForecast);
     try {
@@ -3774,6 +3773,25 @@ function _mergeDeltaRows(deltaRows, { limit = 120 } = {}) {
       .slice(0, limit);
 }
 
+function _rememberMachineDeltaSummaryForSession(sessionId = state.activeSessionId) {
+    if (!sessionId) return;
+    if (state.machineDeltaSummary) state.machineDeltaSummaries[sessionId] = state.machineDeltaSummary;
+    else delete state.machineDeltaSummaries[sessionId];
+}
+
+function _setMachineDeltaSummary(summary) {
+    state.machineDeltaSummary = summary || null;
+    _rememberMachineDeltaSummaryForSession();
+    renderMachineDeltaSummary();
+}
+
+function _restoreMachineDeltaSummaryForSession(sessionId) {
+    state.machineDeltaSummary = (sessionId && state.machineDeltaSummaries[sessionId])
+        ? state.machineDeltaSummaries[sessionId]
+        : null;
+    renderMachineDeltaSummary();
+}
+
 function _buildMachineDeltaSummary(before, nextPayload, directChanges) {
     const periods = nextPayload.periods || state.periods || [];
     const nextPlanning = _snapshotRowsByKey(nextPayload.results || state.results, row => MACHINE_IMPACT_LINES.has(row.line_type));
@@ -3792,7 +3810,7 @@ function _buildMachineDeltaSummary(before, nextPayload, directChanges) {
     const allCascadeRows = _mergeDeltaRows(history.flatMap(h => h.cascadeRows || []), { limit: 100 });
     const allFinancialRows = _mergeDeltaRows(history.flatMap(h => h.financialRows || []), { limit: 60 });
     const biggestFinancial = allFinancialRows[0] || null;
-    state.machineDeltaSummary = {
+    _setMachineDeltaSummary({
         timestamp: event.timestamp,
         history,
         directChanges: allDirectChanges,
@@ -3801,8 +3819,7 @@ function _buildMachineDeltaSummary(before, nextPayload, directChanges) {
         lastCascadeRows: cascadeRows,
         lastFinancialRows: financialRows,
         biggestFinancial,
-    };
-    renderMachineDeltaSummary();
+    });
 }
 
 function _formatDeltaInline(row, maxPeriods = 3) {
@@ -5241,7 +5258,7 @@ async function resetAllEdits() {
             state.valueAuxEdits = {};
             state.valueRowDeltas = {};
             state.demandTurnoverDeltas = {};
-            state.machineDeltaSummary = null;
+            _setMachineDeltaSummary(null);
             _editedRowsOnly = false;
             _planEditFilterMode = null;
             _editedMaterialScope = null;
@@ -7119,7 +7136,7 @@ async function resetMachineEdits() {
         _machineResetInFlight = false;
         return;
     }
-    if (!confirm('Alle OEE/availability wijzigingen terugzetten naar de laatste Calculate-waarden?')) {
+    if (!confirm('Alle OEE, availability en shift-uren terugzetten naar de laatste Calculate-waarden?')) {
         _machineResetInFlight = false;
         return;
     }
@@ -7590,8 +7607,7 @@ async function _doUpload(file) {
         state.valueAuxEdits = {};
         state.valueRowDeltas = {};
         state.demandTurnoverDeltas = {};
-        state.machineDeltaSummary = null;
-        renderMachineDeltaSummary();
+        _setMachineDeltaSummary(null);
         log('Raw data loaded: ' + data.filename + (data.planning_month ? ' | Planning month: ' + data.planning_month : ''));
         _markAutoSaved();
         status('Click Calculate');
@@ -7860,8 +7876,7 @@ async function uploadMultiFiles() {
         state.valueAuxEdits = {};
         state.valueRowDeltas = {};
         state.demandTurnoverDeltas = {};
-        state.machineDeltaSummary = null;
-        renderMachineDeltaSummary();
+        _setMachineDeltaSummary(null);
         log('Extract files loaded: ' + data.filename + (data.planning_month ? ' | Planning month: ' + data.planning_month : ''));
         _markAutoSaved();
         status('Click Calculate');
@@ -7893,7 +7908,13 @@ async function loadSessions() {
     try {
         const res = await fetch('/api/sessions');
         const data = await res.json();
-        if (data.active_session_id) state.activeSessionId = data.active_session_id;
+        if (data.active_session_id) {
+            if (data.active_session_id !== state.activeSessionId) {
+                _rememberMachineDeltaSummaryForSession();
+                state.activeSessionId = data.active_session_id;
+                _restoreMachineDeltaSummaryForSession(data.active_session_id);
+            }
+        }
         else {
             state.activeSessionId = null;
             clearActiveSessionUi();
@@ -7926,7 +7947,7 @@ function clearActiveSessionUi() {
     state.valueAuxEdits = {};
     state.valueRowDeltas = {};
     state.demandTurnoverDeltas = {};
-    state.machineDeltaSummary = null;
+    _setMachineDeltaSummary(null);
     previousValues = {};
     previousValuePlanningValues = {};
     _clearTransientTableState();
@@ -8052,9 +8073,9 @@ async function switchSession(sessionId) {
         if (params.months_actuals !== undefined) document.getElementById('monthsActuals').value = params.months_actuals;
         if (params.months_forecast !== undefined) document.getElementById('monthsForecast').value = params.months_forecast;
         updateHorizonDisplay();
+        _rememberMachineDeltaSummaryForSession();
         state.activeSessionId = data.active_session_id;
-        state.machineDeltaSummary = null;
-        renderMachineDeltaSummary();
+        _restoreMachineDeltaSummaryForSession(data.active_session_id);
         // Sync valuation param inputs to the switched-to session's values.
         if (data.valuation_params) {
             for (let i = 1; i <= 8; i++) {

@@ -230,6 +230,23 @@ def test_update_machine_param_applies_availability_override(machines_route_app):
     }
 
 
+def test_update_machine_param_allows_source_availability_above_100(machines_route_app):
+    response = machines_route_app.client.post(
+        "/api/machines/update",
+        json={"machine": "M1", "field": "availability", "value": 140},
+    )
+
+    assert response.status_code == 200, response.get_json(silent=True)
+    assert machines_route_app.engine.data.machines["M1"].availability_by_period == {
+        "2025-12": pytest.approx(1.40),
+        "2026-01": pytest.approx(1.40),
+    }
+    assert machines_route_app.sess["machine_overrides"]["M1"]["availability_by_period"] == {
+        "2025-12": pytest.approx(1.40),
+        "2026-01": pytest.approx(1.40),
+    }
+
+
 def test_update_machine_param_applies_shift_hours_override(machines_route_app):
     response = machines_route_app.client.post(
         "/api/machines/update",
