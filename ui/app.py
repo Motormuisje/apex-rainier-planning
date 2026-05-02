@@ -6,6 +6,7 @@ import sys
 import io
 import os
 import contextlib
+import threading
 
 from ui.parsers import (
     format_purchased_and_produced as _format_purchased_and_produced,
@@ -131,6 +132,8 @@ GLOBAL_CONFIG_FILE = APP_DATA_ROOT / 'global_config.json'
 _global_config: dict = {}
 _VERBOSE_STARTUP = os.getenv('SOP_VERBOSE_STARTUP', '').strip().lower() in ('1', 'true', 'yes', 'on')
 _DISABLE_AUTORUN = os.getenv('SOP_DISABLE_AUTORUN', '').strip().lower() in ('1', 'true', 'yes', 'on')
+_session_warmup_lock = threading.Lock()
+_session_warmup_events: dict[str, threading.Event] = {}
 
 
 def _restore_engine_state(engine, snapshot: dict) -> None:
@@ -174,6 +177,66 @@ def _save_sessions_to_disk():
 def _load_sessions_from_disk():
     global sessions, active_session_id
     sessions, active_session_id = load_sessions_from_disk(SESSIONS_STORE)
+
+
+def _build_and_install_session_engine(sess: dict):
+    engine = build_clean_engine_for_session(sess, _global_config)
+    if engine is None:
+        return None
+    _install_clean_engine_baseline(sess, engine, clear_machine_overrides=False)
+    with app.app_context():
+        _replay_pending_edits(sess, engine)
+    return engine
+
+
+def _start_session_warmup(session_id: str) -> bool:
+    with _session_warmup_lock:
+        existing = _session_warmup_events.get(session_id)
+        if existing is not None and not existing.is_set():
+            return True
+        event = threading.Event()
+        _session_warmup_events[session_id] = event
+
+    def _worker():
+        sess = sessions.get(session_id)
+        if sess is None:
+            event.set()
+            return
+        label = sess.get('custom_name') or sess.get('filename', session_id)
+        sess['restore_status'] = 'warming'
+        sess['restore_error'] = None
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                engine = _build_and_install_session_engine(sess)
+            if engine is None:
+                sess['restore_status'] = 'cold'
+            elif sessions.get(session_id) is sess:
+                sess['engine'] = engine
+                sess['restore_status'] = 'ready'
+                sess['restore_error'] = None
+        except Exception as exc:
+            sess['restore_status'] = 'failed'
+            sess['restore_error'] = str(exc)
+            import logging
+            logging.getLogger(__name__).error(f'session warmup FAIL "{label}": {exc}')
+        finally:
+            event.set()
+            _save_sessions_to_disk()
+
+    threading.Thread(
+        target=_worker,
+        name=f'session-warmup-{session_id[:8]}',
+        daemon=True,
+    ).start()
+    return True
+
+
+def _wait_for_session_warmup(session_id: str, timeout_seconds: float) -> bool:
+    with _session_warmup_lock:
+        event = _session_warmup_events.get(session_id)
+    if event is None:
+        return False
+    return event.wait(timeout_seconds)
 
 
 def _apply_folder_config():
@@ -255,6 +318,8 @@ app.register_blueprint(create_sessions_blueprint(
     _snapshot_has_manual_edits,
     _engine_has_manual_edits,
     lambda: app.app_context(),
+    _start_session_warmup,
+    _wait_for_session_warmup,
 ))
 app.register_blueprint(create_scenarios_blueprint(
     scenarios,

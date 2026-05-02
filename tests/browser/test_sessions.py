@@ -2,6 +2,13 @@ import pytest
 import requests
 from playwright.sync_api import expect
 
+from tests.browser.test_edits import (
+    CELL_SELECTOR,
+    _drain_edits,
+    _edit_first_demand_cell_to,
+    _prepare_clean_planning_page,
+)
+
 
 # Selector inventory:
 # - #sessionList: session list container in ui/templates/index.html:744.
@@ -34,6 +41,10 @@ SECOND_SESSION_NAME = "Browser sessions test"
 SECOND_PLANNING_MONTH = "2026-01"
 THROWAWAY_SESSION_NAME = "Throwaway delete test"
 THROWAWAY_PLANNING_MONTH = "2024-01"
+RENAME_SESSION_NAME = "Rename browser test"
+RENAMED_SESSION_NAME = "Renamed browser session"
+RENAME_PLANNING_MONTH = "2024-02"
+SAVED_INSTANCE_NAME = "Browser saved instance"
 
 
 def _switch_to_session_via_api(base_url: str, session_id: str) -> None:
@@ -171,3 +182,96 @@ def test_delete_session_removes_from_sidebar(browser_page, golden_fixture_path):
             has=page.locator(".session-name-edit", has_text=THROWAWAY_SESSION_NAME)
         )
     ).to_have_count(0)
+
+
+def test_rename_session_updates_sidebar(browser_page, golden_fixture_path):
+    base_url = browser_page.server["base_url"]
+    session_id = _upload_session(
+        base_url,
+        golden_fixture_path,
+        RENAME_SESSION_NAME,
+        RENAME_PLANNING_MONTH,
+    )
+
+    try:
+        page = browser_page
+        page.reload(wait_until="networkidle")
+
+        session_item = page.locator(".session-item").filter(
+            has=page.locator(".session-name-edit", has_text=RENAME_SESSION_NAME)
+        )
+        expect(session_item).to_be_visible(timeout=60000)
+        name_edit = page.locator(f'.session-name-edit[data-session-id="{session_id}"]')
+        expect(name_edit).to_have_text(RENAME_SESSION_NAME)
+
+        with page.expect_response(
+            lambda response: "/api/sessions/rename" in response.url and response.ok,
+            timeout=60000,
+        ) as rename_response:
+            name_edit.click()
+            name_edit.press("Control+A")
+            name_edit.fill(RENAMED_SESSION_NAME)
+            name_edit.press("Enter")
+        rename_payload = rename_response.value.json()
+        assert rename_payload.get("success"), f"Rename failed: {rename_payload}"
+
+        renamed_item = page.locator(".session-item").filter(
+            has=page.locator(".session-name-edit", has_text=RENAMED_SESSION_NAME)
+        )
+        expect(renamed_item).to_be_visible(timeout=60000)
+        expect(
+            page.locator(".session-item").filter(
+                has=page.locator(".session-name-edit", has_text=RENAME_SESSION_NAME)
+            )
+        ).to_have_count(0)
+    finally:
+        requests.delete(base_url + f"/api/sessions/{session_id}", timeout=30)
+        _switch_to_session_via_api(base_url, browser_page.server["session_id"])
+
+
+def test_save_instance_reopens_with_pending_edit(browser_page):
+    base_url = browser_page.server["base_url"]
+    original_session_id = browser_page.server["session_id"]
+
+    _switch_to_session_via_api(base_url, original_session_id)
+    _drain_edits(base_url)
+    page = browser_page
+    _prepare_clean_planning_page(page, base_url)
+
+    _, _, _ = _edit_first_demand_cell_to(page, "999")
+    expect(page.locator("#editSummaryBar")).to_be_visible()
+    expect(page.locator("#editSummaryCount")).to_contain_text("1")
+
+    with page.expect_response(
+        lambda response: "/api/sessions/snapshot" in response.url and response.ok,
+        timeout=60000,
+    ) as snapshot_response:
+        page.locator("button", has_text="Opslaan als instantie").click()
+        expect(page.locator("#saveInstanceName")).to_be_visible()
+        page.locator("#saveInstanceName").fill(SAVED_INSTANCE_NAME)
+        page.locator("#saveInstanceModal button", has_text="Opslaan").click()
+    snapshot_payload = snapshot_response.value.json()
+    assert snapshot_payload.get("success"), f"Snapshot failed: {snapshot_payload}"
+    saved_session_id = snapshot_payload["session"]["id"]
+
+    saved_item = page.locator(".session-item").filter(
+        has=page.locator(".session-name-edit", has_text=SAVED_INSTANCE_NAME)
+    )
+    expect(saved_item).to_be_visible(timeout=60000)
+    expect(saved_item.locator(".session-badge.calculated")).to_be_visible()
+
+    with page.expect_response(
+        lambda response: "/api/sessions/switch" in response.url and response.ok,
+        timeout=180000,
+    ) as switch_response:
+        saved_item.locator(".session-badge.calculated").click()
+    switch_payload = switch_response.value.json()
+    assert switch_payload.get("success"), f"Switch failed: {switch_payload}"
+    assert switch_payload.get("active_session_id") == saved_session_id
+
+    page.wait_for_load_state("networkidle")
+    expect(page.locator("#busyOverlay")).to_have_class("hidden", timeout=120000)
+    expect(page.locator("#planBody tr[data-material][data-linetype]").first).to_be_visible(timeout=120000)
+    expect(page.locator("#editSummaryBar")).to_be_visible(timeout=60000)
+    expect(page.locator("#editSummaryCount")).to_contain_text("1")
+    expect(page.locator(CELL_SELECTOR).filter(has_text="999").first).to_be_visible(timeout=60000)

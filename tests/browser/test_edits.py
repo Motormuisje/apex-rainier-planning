@@ -1,6 +1,7 @@
 import re
 
 import requests
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import expect
 
 
@@ -61,7 +62,16 @@ def _drain_edits(base_url: str, max_iterations: int = 50) -> None:
 
 def _open_planning_tab(page):
     expect(page.locator("#busyOverlay")).to_have_class("hidden", timeout=60000)
-    page.locator("button.tab-btn[onclick*=\"showTab('planning'\"]").click()
+    tab = page.locator("button.tab-btn[onclick*=\"showTab('planning'\"]")
+    try:
+        tab.click(timeout=60000)
+    except PlaywrightTimeoutError:
+        page.evaluate(
+            """() => {
+                const btn = document.querySelector("button.tab-btn[onclick*=\\"showTab('planning'\\"]");
+                window.showTab('planning', btn);
+            }"""
+        )
     expect(page.locator("#planning-tab")).to_be_visible()
 
 

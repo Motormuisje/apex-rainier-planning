@@ -291,6 +291,18 @@ def session_route_app(golden_fixture_path):
     global_config = {}
     save_calls = []
     sync_calls = []
+    build_calls = []
+    replay_calls = []
+    install_calls = []
+    warmup_calls = []
+    wait_calls = []
+    callback_overrides = {
+        "build_clean_engine_for_session": None,
+        "replay_pending_edits": None,
+        "install_clean_engine_baseline": None,
+        "start_session_warmup": None,
+        "wait_for_session_warmup": None,
+    }
 
     def crash_callback(*args, **kwargs):
         raise RuntimeError("unexpected callback called in session route test")
@@ -350,10 +362,42 @@ def session_route_app(golden_fixture_path):
         sync_calls.append(engine)
         sync_global_config_from_engine(engine, global_config, format_purchased_and_produced)
 
+    def build_clean_engine_for_session(sess, params=None):
+        build_calls.append((sess, params))
+        callback = callback_overrides["build_clean_engine_for_session"]
+        if callback is not None:
+            return callback(sess, params)
+        return crash_callback(sess, params)
+
     def install_clean_engine_baseline(sess, engine, clear_machine_overrides=True):
+        install_calls.append((sess, engine, clear_machine_overrides))
+        callback = callback_overrides["install_clean_engine_baseline"]
+        if callback is not None:
+            return callback(sess, engine, clear_machine_overrides)
         sess["reset_baseline"] = snapshot_engine_state(engine, shift_hours_lookup)
         if clear_machine_overrides:
             sess["machine_overrides"] = {}
+
+    def replay_pending_edits(sess, engine):
+        replay_calls.append((sess, engine))
+        callback = callback_overrides["replay_pending_edits"]
+        if callback is not None:
+            return callback(sess, engine)
+        return None
+
+    def start_session_warmup(session_id):
+        warmup_calls.append(session_id)
+        callback = callback_overrides["start_session_warmup"]
+        if callback is not None:
+            return callback(session_id)
+        return False
+
+    def wait_for_session_warmup(session_id, timeout_seconds):
+        wait_calls.append((session_id, timeout_seconds))
+        callback = callback_overrides["wait_for_session_warmup"]
+        if callback is not None:
+            return callback(session_id, timeout_seconds)
+        return False
 
     flask_app = Flask(__name__)
     flask_app.config["TESTING"] = True
@@ -366,12 +410,14 @@ def session_route_app(golden_fixture_path):
         machine_overrides_from_engine,
         save_sessions_to_disk,
         sync_config,
-        crash_callback,
+        build_clean_engine_for_session,
         install_clean_engine_baseline,
-        lambda sess, engine: None,
+        replay_pending_edits,
         snapshot_has_manual_edits,
         engine_has_manual_edits,
         lambda: flask_app.app_context(),
+        start_session_warmup,
+        wait_for_session_warmup,
     ))
 
     return SimpleNamespace(
@@ -384,4 +430,10 @@ def session_route_app(golden_fixture_path):
         global_config=global_config,
         save_calls=save_calls,
         sync_calls=sync_calls,
+        build_calls=build_calls,
+        replay_calls=replay_calls,
+        install_calls=install_calls,
+        warmup_calls=warmup_calls,
+        wait_calls=wait_calls,
+        callback_overrides=callback_overrides,
     )

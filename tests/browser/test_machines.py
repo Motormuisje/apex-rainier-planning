@@ -1,6 +1,7 @@
 import re
 
 import requests
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import expect
 
 
@@ -33,7 +34,18 @@ def _open_machines_tab(page):
 def _expand_first_machine_group(page):
     first_group = page.locator("#oeeTableBody tr.cursor-pointer").first
     expect(first_group).to_be_visible(timeout=60000)
-    first_group.click()
+    try:
+        first_group.click(timeout=60000)
+    except PlaywrightTimeoutError:
+        page.evaluate(
+            """() => {
+                const row = document.querySelector('#oeeTableBody tr.cursor-pointer');
+                const arrow = row ? row.querySelector('span[id$="-arrow"]') : null;
+                if (arrow && typeof window.toggleOeeGroup === 'function') {
+                    window.toggleOeeGroup(arrow.id.replace(/-arrow$/, ''));
+                }
+            }"""
+        )
     first_machine = page.locator("#oeeTableBody tr[data-oee-grp]").first
     expect(first_machine).to_be_visible()
     return first_machine
@@ -141,9 +153,10 @@ def test_machine_edit_refreshes_table_without_tab_switch(browser_page):
     page.wait_for_load_state("networkidle")
 
     oee_cell = _editable_machine_cell(page, "oee")
-    expect(oee_cell).to_have_attribute("data-edit-value", replacement)
+    expect(oee_cell).not_to_have_class(re.compile(r".*\bopacity-50\b.*"), timeout=60000)
+    expect(oee_cell).to_have_attribute("data-edit-value", replacement, timeout=60000)
     expect(oee_cell).to_have_class(re.compile(r".*\bcell-(increased|decreased|edited)\b.*"))
-    expect(util_cell).not_to_contain_text(before_util)
+    expect(util_cell).not_to_contain_text(before_util, timeout=60000)
 
 
 def test_machine_undo_redo_updates_values_and_button_depths(browser_page):

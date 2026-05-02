@@ -73,6 +73,8 @@ def test_save_sessions_to_disk_persists_metadata_without_engine(tmp_path):
     assert loaded["s1"]["valuation_params"] == saved["valuation_params"]
     assert loaded["s1"]["undo_stack"] == []
     assert loaded["s1"]["redo_stack"] == []
+    assert loaded["s1"]["restore_status"] == "cold"
+    assert loaded["s1"]["restore_error"] is None
 
 
 def test_save_sessions_to_disk_uses_baseline_valuation_when_engine_missing(tmp_path):
@@ -90,6 +92,71 @@ def test_save_sessions_to_disk_uses_baseline_valuation_when_engine_missing(tmp_p
     saved = json.loads(store_path.read_text(encoding="utf-8"))["sessions"]["s1"]
     assert saved["valuation_params"] == {"1": 10.0}
     assert saved["machine_overrides"] == {"PBA02": {"availability": 0.8}}
+
+
+def test_snapshot_session_metadata_survives_cold_start(tmp_path):
+    store_path = tmp_path / "sessions_store.json"
+    sessions = {
+        "snap-1": {
+            "id": "snap-1",
+            "file_path": "C:/fixtures/golden.xlsm",
+            "extract_files": {"bom_file": "bom.xlsx"},
+            "filename": "golden.xlsm",
+            "custom_name": "Saved instance",
+            "is_snapshot": True,
+            "engine": None,
+            "metadata": {
+                "materials": 1,
+                "periods": 12,
+                "site": "NLX1",
+                "planning_month": "2025-12",
+            },
+            "uploaded_at": "2026-04-22T08:00:00",
+            "parameters": {
+                "planning_month": "2025-12",
+                "months_actuals": 11,
+                "months_forecast": 12,
+            },
+            "pending_edits": {
+                "01. Demand forecast||MAT-1||||2025-12": {
+                    "original": 10.0,
+                    "new_value": 12.0,
+                },
+            },
+            "value_aux_overrides": {
+                "01. Demand forecast||MAT-1": {
+                    "original": 1.0,
+                    "new_value": 2.0,
+                },
+            },
+            "machine_overrides": {"M1": {"oee": 0.9}},
+            "valuation_params": {"1": 10.0, "2": 20.0},
+            "undo_stack": [{"ignored": True}],
+            "redo_stack": [{"ignored": True}],
+        }
+    }
+
+    save_sessions_to_disk(
+        sessions,
+        "snap-1",
+        store_path,
+        lambda sess, engine: sess.get("machine_overrides", {}),
+    )
+
+    loaded, active = load_sessions_from_disk(store_path)
+    restored = loaded["snap-1"]
+    assert active == "snap-1"
+    assert restored["engine"] is None
+    assert restored["is_snapshot"] is True
+    assert restored["parameters"] == sessions["snap-1"]["parameters"]
+    assert restored["pending_edits"] == sessions["snap-1"]["pending_edits"]
+    assert restored["value_aux_overrides"] == sessions["snap-1"]["value_aux_overrides"]
+    assert restored["machine_overrides"] == sessions["snap-1"]["machine_overrides"]
+    assert restored["valuation_params"] == sessions["snap-1"]["valuation_params"]
+    assert restored["undo_stack"] == []
+    assert restored["redo_stack"] == []
+    assert restored["restore_status"] == "cold"
+    assert restored["restore_error"] is None
 
 
 def test_load_sessions_from_disk_returns_empty_when_store_missing(tmp_path):

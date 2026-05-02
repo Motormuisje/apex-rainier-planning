@@ -7993,8 +7993,11 @@ function renderSessionList(groups, activeId) {
         html += `<div class="session-group-header">${groupLabel}</div>`;
         for (const sess of groups[key]) {
             const isActive = sess.id === activeId;
-            const badgeCls = sess.calculated ? 'calculated' : 'pending';
-            const badgeTxt = sess.calculated ? 'Ready' : (sess.is_snapshot ? 'Saved scenario' : 'Pending');
+            const restoreStatus = sess.restore_status || (sess.calculated ? 'ready' : 'pending');
+            const badgeCls = (restoreStatus === 'ready' || sess.calculated) ? 'calculated' : 'pending';
+            const badgeTxt = restoreStatus === 'warming' ? 'Warming'
+                : (restoreStatus === 'failed' ? 'Failed'
+                : (sess.calculated ? 'Ready' : (sess.is_snapshot ? 'Saved scenario' : 'Pending')));
             const nameColor = isActive ? '#93c5fd' : '#e2e8f0';
             const mats = (sess.metadata && sess.metadata.materials) || 0;
             const displayName = sess.custom_name || sess.filename;
@@ -8063,6 +8066,17 @@ async function switchSession(sessionId) {
         _loadPendingEditsIntoState(data.pending_edits || {});
         _loadValueAuxOverridesIntoState(data.value_aux_overrides || {});
         updateEditBadge();
+        if (data.restore_status === 'warming' && !data.calculated) {
+            state.results = null; state.valueResults = null; state.consolidation = [];
+            document.getElementById('exportBtn').disabled = true;
+            document.getElementById('exportDbBtn').disabled = true;
+            status('Sessie wordt voorbereid...');
+            setTimeout(() => {
+                if (state.activeSessionId === sessionId && !_isSwitchingSession) switchSession(sessionId);
+            }, 1500);
+            await loadSessions();
+            return;
+        }
         if (data.calculated) {
             await loadResults();
             await loadValueResults();
