@@ -3253,7 +3253,7 @@ function renderInvQualityChart(invQuality, periods, financials) {
         : null;
 
     const datasets = [
-        { label: 'Understock',    data: toData(agg.under),     backgroundColor: 'rgba(220,38,38,0.85)',  stack: 'inv' },
+        { label: 'Understock',    data: toData(agg.under),     backgroundColor: 'rgba(220,38,38,0.85)',  stack: 'under' },
         { label: 'Safety stock',  data: toData(agg.safety),    backgroundColor: 'rgba(21,128,61,0.85)',  stack: 'inv' },
         { label: 'Strategic',     data: toData(agg.strategic), backgroundColor: 'rgba(217,119,6,0.85)',  stack: 'inv' },
         { label: 'Normal',        data: toData(agg.normal),    backgroundColor: 'rgba(234,179,8,0.85)',  stack: 'inv' },
@@ -3274,7 +3274,7 @@ function renderInvQualityChart(invQuality, periods, financials) {
             },
             scales: {
                 x: { stacked: true, grid: { color: 'rgba(255,255,255,0.04)' }, ticks: { color: '#94a3b8', maxRotation: 30, font: { size: 9 } } },
-                y: { stacked: true, grid: { color: '#334155' }, ticks: { color: '#94a3b8', callback: v => v.toFixed(0) + 'K' } }
+                y: { stacked: true, beginAtZero: false, grace: '10%', grid: { color: '#334155' }, ticks: { color: '#94a3b8', callback: v => v.toFixed(0) + 'K' } }
             }
         }
     });
