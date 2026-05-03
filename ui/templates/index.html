@@ -8,6 +8,7 @@
     <link rel="shortcut icon" href="/static/favicon.ico" type="image/x-icon">
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2/dist/chartjs-plugin-datalabels.min.js"></script>
     <style>
         body { background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); min-height: 100vh; }
         .card { background: rgba(30, 41, 59, 0.8); border: 1px solid rgba(255, 255, 255, 0.1); }
@@ -3258,11 +3259,15 @@ function renderInvQualityChart(invQuality, periods, financials) {
         { label: 'Strategic',     data: toData(agg.strategic), backgroundColor: 'rgba(217,119,6,0.85)',  stack: 'inv' },
         { label: 'Normal',        data: toData(agg.normal),    backgroundColor: 'rgba(234,179,8,0.85)',  stack: 'inv' },
         { label: 'Overstock',     data: toData(agg.overstock), backgroundColor: 'rgba(248,113,113,0.85)',stack: 'inv' },
-        { label: 'Actual stock',  data: toData(agg.inventory), type: 'line', borderColor: '#a855f7', backgroundColor: 'transparent', borderWidth: 2, pointRadius: 2, fill: false, stack: undefined },
+        { label: 'Actual stock',  data: toData(agg.inventory), type: 'line', borderColor: '#a855f7', backgroundColor: 'transparent', borderWidth: 2, pointRadius: 2, fill: false, stack: undefined,
+          datalabels: { display: true, align: 'top', anchor: 'end', color: '#c4b5fd', font: { size: 8 },
+            formatter: v => v == null ? '' : Math.round(v * 1000).toLocaleString('nl-NL') } },
     ];
-    if (cogData) datasets.push({ label: 'Cost of Goods', data: cogData, type: 'line', borderColor: '#7dd3fc', backgroundColor: 'transparent', borderWidth: 1.5, pointRadius: 0, borderDash: [4,3], fill: false, stack: undefined });
+    if (cogData) datasets.push({ label: 'Cost of Goods', data: cogData, type: 'line', borderColor: '#7dd3fc', backgroundColor: 'transparent', borderWidth: 1.5, pointRadius: 0, borderDash: [4,3], fill: false, stack: undefined,
+        datalabels: { display: false } });
 
     window._invQualityChart = new Chart(canvas.getContext('2d'), {
+        plugins: [ChartDataLabels],
         type: 'bar',
         data: { labels, datasets },
         options: {
@@ -3270,7 +3275,8 @@ function renderInvQualityChart(invQuality, periods, financials) {
             interaction: { mode: 'index', intersect: false },
             plugins: {
                 legend: { labels: { color: '#94a3b8', boxWidth: 10, font: { size: 9 } } },
-                tooltip: { callbacks: { label: ctx => ` ${ctx.dataset.label}: ${ctx.parsed.y.toFixed(0)}K` } }
+                tooltip: { callbacks: { label: ctx => ` ${ctx.dataset.label}: ${ctx.parsed.y.toFixed(0)}K` } },
+                datalabels: { display: false }
             },
             scales: {
                 x: { stacked: true, grid: { color: 'rgba(255,255,255,0.04)' }, ticks: { color: '#94a3b8', maxRotation: 30, font: { size: 9 } } },
