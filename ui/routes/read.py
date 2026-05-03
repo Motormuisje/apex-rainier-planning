@@ -135,12 +135,11 @@ def create_read_blueprint(
         top_10_overstocks: list = []
         total_overstock = 0.0
         try:
-            if current_engine._iq_cache is None or not current_engine._iq_cache.get('per_material'):
-                current_engine._iq_cache = InventoryQualityEngine(
-                    current_engine.data,
-                    current_engine.results,
-                    current_engine.value_results,
-                ).calculate()
+            current_engine._iq_cache = InventoryQualityEngine(
+                current_engine.data,
+                current_engine.results,
+                current_engine.value_results,
+            ).calculate()
             iq_result = current_engine._iq_cache or {}
             inventory_quality = iq_result.get('per_material', [])
             top_10_overstocks = iq_result.get('top_10_overstocks', [])

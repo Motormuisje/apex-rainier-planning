@@ -3249,7 +3249,7 @@ function renderInvQualityChart(invQuality, periods, financials) {
     const labels = allPeriods;
     const toData = obj => allPeriods.map(p => (obj[p] || 0) / 1000);
     const cogData = financials && financials['COST OF GOODS']
-        ? allPeriods.map(p => (financials['COST OF GOODS'][p] || 0) / 1000)
+        ? allPeriods.map(p => p === 'Starting stock' ? null : (financials['COST OF GOODS'][p] || 0) / 1000)
         : null;
 
     const datasets = [
