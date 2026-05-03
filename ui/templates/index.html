@@ -3231,24 +3231,25 @@ function renderInvQualityChart(invQuality, periods, financials) {
     if (window._invQualityChart) { window._invQualityChart.destroy(); window._invQualityChart = null; }
     if (!invQuality || !invQuality.length || !periods.length) return;
 
-    // Aggregate across all materials per period
+    // Aggregate across all materials per period, including starting stock
+    const allPeriods = ['Starting stock', ...periods];
     const agg = { under:{}, safety:{}, strategic:{}, normal:{}, overstock:{}, inventory:{} };
     for (const mat of invQuality) {
-        for (const p of periods) {
+        for (const p of allPeriods) {
             const d = (mat.periods && mat.periods[p]) || {};
-            agg.under[p]     = (agg.under[p]     || 0) + Math.abs(d.under     || 0);
-            agg.safety[p]    = (agg.safety[p]     || 0) + Math.abs(d.safety    || 0);
-            agg.strategic[p] = (agg.strategic[p]  || 0) + Math.abs(d.strategic || 0);
-            agg.normal[p]    = (agg.normal[p]     || 0) + Math.abs(d.normal    || 0);
-            agg.overstock[p] = (agg.overstock[p]  || 0) + Math.abs(d.overstock || 0);
+            agg.under[p]     = (agg.under[p]     || 0) + (d.under     || 0);
+            agg.safety[p]    = (agg.safety[p]     || 0) + (d.safety    || 0);
+            agg.strategic[p] = (agg.strategic[p]  || 0) + (d.strategic || 0);
+            agg.normal[p]    = (agg.normal[p]     || 0) + (d.normal    || 0);
+            agg.overstock[p] = (agg.overstock[p]  || 0) + (d.overstock || 0);
             agg.inventory[p] = (agg.inventory[p]  || 0) + (d.inventory || 0);
         }
     }
 
-    const labels = ['Starting stock', ...periods];
-    const toData = obj => [0, ...periods.map(p => (obj[p] || 0) / 1000)];
+    const labels = allPeriods;
+    const toData = obj => allPeriods.map(p => (obj[p] || 0) / 1000);
     const cogData = financials && financials['COST OF GOODS']
-        ? [0, ...periods.map(p => (financials['COST OF GOODS'][p] || 0) / 1000)]
+        ? allPeriods.map(p => (financials['COST OF GOODS'][p] || 0) / 1000)
         : null;
 
     const datasets = [
