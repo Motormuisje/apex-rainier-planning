@@ -131,6 +131,13 @@ def create_read_blueprint(
             decimals = 6 if key == 'ROCE' else 0
             financials[key] = {period: round(value, decimals) for period, value in row.values.items()}
 
+        if 'INVENTORY VALUE' in financials:
+            inv_starting = sum(
+                r.starting_stock
+                for r in current_engine.value_results.get(LineType.INVENTORY.value, [])
+            )
+            financials['INVENTORY VALUE']['Starting stock'] = round(inv_starting, 0)
+
         inventory_quality: list = []
         top_10_overstocks: list = []
         total_overstock = 0.0

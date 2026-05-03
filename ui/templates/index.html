@@ -3335,6 +3335,7 @@ function renderFinancialChart(financials, periods) {
     if (!canvas) return;
     if (financialChart) { financialChart.destroy(); financialChart = null; }
     if (!financials || !periods.length) return;
+    const allPeriods = ['Starting stock', ...periods];
     const METRICS = [
         { key: 'TURNOVER',          color: '#22c55e',  label: 'Turnover' },
         { key: 'COST OF GOODS',     color: '#f97316',  label: 'Cost of Goods' },
@@ -3346,17 +3347,21 @@ function renderFinancialChart(financials, periods) {
         .filter(m => financials[m.key])
         .map(m => ({
             label: m.label,
-            data: periods.map(p => (financials[m.key][p] || 0) / 1000),
+            data: allPeriods.map(p => {
+                const v = financials[m.key][p];
+                return (v != null) ? v / 1000 : null;
+            }),
             borderColor: m.color,
             backgroundColor: m.color.replace('#', 'rgba(') + ',0.08)',  // fallback; overridden below
             borderWidth: 2,
             tension: 0.3,
             pointRadius: 3,
             fill: false,
+            spanGaps: false,
         }));
     financialChart = new Chart(canvas.getContext('2d'), {
         type: 'line',
-        data: { labels: periods, datasets },
+        data: { labels: allPeriods, datasets },
         options: {
             responsive: true,
             interaction: { mode: 'index', intersect: false },
