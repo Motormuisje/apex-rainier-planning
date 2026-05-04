@@ -10,6 +10,7 @@ For each BOM level:
 Then: capacity utilization, shift availability, available capacity, utilization rate, FTE
 """
 
+import copy
 import pandas as pd
 from typing import Dict, List, Optional
 from datetime import datetime
@@ -18,6 +19,24 @@ from collections import defaultdict
 
 from modules.models import PlanningRow, LineType
 from modules.data_loader import DataLoader
+
+# Module-level DataLoader cache: (file_path, mtime) → DataLoader instance.
+# Avoids re-parsing the XLSM on every engine rebuild (parameter change, reset)
+# in the web UI. The cache is invalidated automatically when the file changes.
+_DATA_CACHE: Dict[tuple, DataLoader] = {}
+_DATA_CACHE_MAX = 3  # keep at most 3 files to avoid unbounded memory growth
+
+
+def invalidate_data_cache(file_path: str = None):
+    """Remove a specific file (or all files) from the DataLoader cache.
+
+    Call this after a new file is uploaded so the next rebuild re-parses it.
+    """
+    global _DATA_CACHE
+    if file_path is None:
+        _DATA_CACHE.clear()
+    else:
+        _DATA_CACHE = {k: v for k, v in _DATA_CACHE.items() if k[0] != str(file_path)}
 try:
     from modules.inventory_quality_engine import InventoryQualityEngine as _IQEngine
 except ImportError:
@@ -83,14 +102,38 @@ class PlanningEngine:
         print("S&OP PLANNING ENGINE - FULL CALCULATION")
         print("=" * 70)
 
-        # ===== STEP 1: Load data =====
+        # ===== STEP 1: Load data (with file-level cache) =====
         print("\n[STEP 1] Loading raw input data...")
-        if self.extract_files:
-            self.data = DataLoader(excel_file=self.file_path, extract_files=self.extract_files,
-                                   config_overrides=self.config_overrides)
+        _cache_key = None
+        if self.file_path and not self.extract_files:
+            try:
+                _mtime = Path(self.file_path).stat().st_mtime
+                _cache_key = (str(self.file_path), _mtime)
+            except OSError:
+                pass
+
+        if _cache_key and _cache_key in _DATA_CACHE:
+            print("  >> Using cached DataLoader (file unchanged)")
+            # Shallow-copy the loader, then deep-copy the mutable fields that
+            # _apply_config_overrides writes to, so the cache is never mutated.
+            self.data = copy.copy(_DATA_CACHE[_cache_key])
+            self.data.config = copy.copy(self.data.config)
+            self.data.purchased_and_produced = dict(self.data.purchased_and_produced)
+            # Re-apply config_overrides so UI parameter changes take effect on the copy
+            if self.config_overrides:
+                self.data.config_overrides = self.config_overrides
+                self.data._apply_config_overrides()
         else:
-            self.data = DataLoader(self.file_path, config_overrides=self.config_overrides)
-        self.data.load_all()
+            if self.extract_files:
+                self.data = DataLoader(excel_file=self.file_path, extract_files=self.extract_files,
+                                       config_overrides=self.config_overrides)
+            else:
+                self.data = DataLoader(self.file_path, config_overrides=self.config_overrides)
+            self.data.load_all()
+            if _cache_key is not None:
+                if len(_DATA_CACHE) >= _DATA_CACHE_MAX:
+                    _DATA_CACHE.pop(next(iter(_DATA_CACHE)))
+                _DATA_CACHE[_cache_key] = self.data
 
         # ===== STEP 1b: Apply UI parameter overrides =====
         # All three UI values (planning_month, months_forecast, months_actuals) must be
@@ -673,38 +716,37 @@ class PlanningEngine:
             _ov_chart2_anchor = 'A' + str(_chart_base + 24)   # Inventory Quality (Phase 2)
             _ov_chart3_anchor = 'A' + str(_chart_base + 60)   # Top 10 Overstocks (Phase 2)
 
-            # Chart 1 — Projected Financial Metrics (PNG embed)
+            # Charts 1, 4, 5 — collect data then render in parallel (Agg backend is thread-safe)
             _fm_series = {}
             for _m in ['TURNOVER', 'COST OF GOODS', 'GROSS MARGIN', 'INVENTORY VALUE']:
                 for _row in consol_rows:
                     if _row.material_number.replace('ZZZZZZ_', '') == _m:
                         _fm_series[_m] = [_row.get_value(p) for p in self.data.periods]
                         break
-            _fm_img = _XLImage(_cr.financial_metrics(self.data.periods, _fm_series))
-            _fm_img.anchor = 'A' + str(_chart_base)
-            ws_overview.add_image(_fm_img)
-
-            # Chart 4 — ROCE Components (PNG embed)
             _rc_series = {}
             for _m in ['EBIT', 'CAPITAL INVESTMENT', 'OPERATIONAL CASHFLOW']:
                 for _row in consol_rows:
                     if _row.material_number.replace('ZZZZZZ_', '') == _m:
                         _rc_series[_m] = [_row.get_value(p) for p in self.data.periods]
                         break
-            _rc_img = _XLImage(_cr.roce_components(self.data.periods, _rc_series))
-            _rc_img.anchor = 'A' + str(_chart_base + 90)
-            ws_overview.add_image(_rc_img)
-
-            # Chart 5 — ROCE bar + 15% target + average line (PNG embed)
             _roce_vals = []
             for _row in consol_rows:
                 if 'ROCE' in _row.material_number and 'CAPITAL' not in _row.material_number:
                     _roce_vals = [_row.get_value(p) for p in self.data.periods]
                     break
-            _rb_img = _XLImage(_cr.roce_bar(
-                self.data.periods, _roce_vals, target=0.15, average=_roce_avg_val
-            ))
-            _rb_img.anchor = 'A' + str(_chart_base + 114)
+
+            from concurrent.futures import ThreadPoolExecutor as _TPE
+            _periods = self.data.periods
+            with _TPE(max_workers=3) as _ex:
+                _f_fm = _ex.submit(_cr.financial_metrics, _periods, _fm_series)
+                _f_rc = _ex.submit(_cr.roce_components,   _periods, _rc_series)
+                _f_rb = _ex.submit(_cr.roce_bar, _periods, _roce_vals, 0.15, _roce_avg_val)
+
+            _fm_img = _XLImage(_f_fm.result()); _fm_img.anchor = 'A' + str(_chart_base)
+            _rc_img = _XLImage(_f_rc.result()); _rc_img.anchor = 'A' + str(_chart_base + 90)
+            _rb_img = _XLImage(_f_rb.result()); _rb_img.anchor = 'A' + str(_chart_base + 114)
+            ws_overview.add_image(_fm_img)
+            ws_overview.add_image(_rc_img)
             ws_overview.add_image(_rb_img)
 
             # ---- Top 10 Overstocks sheet (VBA CreateTop10OverstocksChart line 7116) ----
@@ -752,10 +794,8 @@ class PlanningEngine:
                                 _pd = _item.get('periods', {}).get(_p, {})
                                 _vals.append(float(_pd.get('overstock', 0)) if isinstance(_pd, dict) else 0.0)
                             _t10_mats.append({'name': _item.get('material_name') or _item['material_number'], 'values': _vals})
-                        _t10_img = _XLImage(_cr.top10_overstocks(t10_periods, _t10_mats))
                         max_row = 1 + num_p
-                        _t10_img.anchor = 'A' + str(max_row + 2)
-                        ws_t10.add_image(_t10_img)
+                        _t10_anchor_dedicated = 'A' + str(max_row + 2)
                         top10_count = num_mats
             except Exception as e:
                 print(f"  Warning: Top 10 overstocks sheet skipped: {e}")
@@ -824,7 +864,7 @@ class PlanningEngine:
                         num_iq_p = len(iq_periods)
                         max_iq_row = 1 + num_iq_p
 
-                        # --- Inventory Quality chart (PNG embed) ---
+                        # --- Collect IQ chart data (render deferred for parallel batch) ---
                         _iq_bands = {
                             band: [round(period_totals.get(p, {}).get(band, 0), 0)
                                    for p in iq_periods]
@@ -838,59 +878,85 @@ class PlanningEngine:
                                 _iq_cogs.append(float(cogs_row.values[_p]) if cogs_row and _p in cogs_row.values else 0.0)
                             except (TypeError, ValueError):
                                 _iq_cogs.append(0.0)
-                        _iq_img = _XLImage(_cr.inventory_quality(
-                            iq_periods, _iq_bands, _iq_actual, _iq_cogs
-                        ))
-                        _iq_img.anchor = 'A' + str(max_iq_row + 2)
-                        ws_iq.add_image(_iq_img)
                         iq_chart_done = True
             except Exception as e:
                 print(f"  Warning: Inventory quality chart sheet skipped: {e}")
 
-            # ---- High-level overview (Phase 2) — IQ and Top 10 PNG copies ----
-            try:
-                if iq_chart_done:
-                    _ov_iq_img = _XLImage(_cr.inventory_quality(
-                        iq_periods, _iq_bands, _iq_actual, _iq_cogs
-                    ))
-                    _ov_iq_img.anchor = _ov_chart2_anchor
-                    ws_overview.add_image(_ov_iq_img)
-            except Exception as _e2:
-                print(f"  Warning: Overview inventory quality chart skipped: {_e2}")
-
-            try:
-                if top10_count:
-                    _ov_t10_img = _XLImage(_cr.top10_overstocks(t10_periods, _t10_mats))
-                    _ov_t10_img.anchor = _ov_chart3_anchor
-                    ws_overview.add_image(_ov_t10_img)
-            except Exception as _e3:
-                print(f"  Warning: Overview Top 10 chart skipped: {_e3}")
-
-            # ===== MoM Comparison sheet + scatter chart =====
+            # ===== MoM Comparison — compute data (scatter render deferred to parallel batch) =====
             mom_done = False
+            _scatter_data = None
+            _ws_mom = None
             if previous_cycle_df is not None:
                 try:
                     from modules.mom_comparison_engine import MoMComparisonEngine
+                    import io as _io
                     _mom_eng = MoMComparisonEngine(df_volumes, previous_cycle_df)
                     _mom_df = _mom_eng.calculate()
                     if not _mom_df.empty:
                         _mom_df.to_excel(writer, sheet_name='MoM Comparison', index=False)
                         _ws_mom = writer.sheets['MoM Comparison']
-
-                        # --- scatter chart: Current vs Previous inventory ---
                         _scatter_data = _mom_eng.create_scatter_data()
-                        if _scatter_data['materials']:
-                            _scat_img = _XLImage(_cr.mom_scatter(
-                                _scatter_data['materials'],
-                                _scatter_data['previous'],
-                                _scatter_data['current'],
-                                _scatter_data['colors'],
-                            ))
-                            _scat_img.anchor = 'J2'
-                            _ws_mom.add_image(_scat_img)
                         mom_done = True
                 except Exception as _e_mom:
                     print(f"  Warning: MoM comparison sheet skipped: {_e_mom}")
+
+            # ---- Parallel render: IQ + Top 10 + MoM scatter (all independent) ----
+            import io as _io
+            _deferred_renders = {}
+            if iq_chart_done:
+                _deferred_renders['iq'] = (
+                    _cr.inventory_quality, (iq_periods, _iq_bands, _iq_actual, _iq_cogs), {}
+                )
+            if top10_count:
+                _deferred_renders['t10'] = (
+                    _cr.top10_overstocks, (t10_periods, _t10_mats), {}
+                )
+            if _scatter_data and _scatter_data.get('materials'):
+                _deferred_renders['scat'] = (
+                    _cr.mom_scatter,
+                    (_scatter_data['materials'], _scatter_data['previous'],
+                     _scatter_data['current'], _scatter_data['colors']),
+                    {}
+                )
+
+            if _deferred_renders:
+                with _TPE(max_workers=min(4, len(_deferred_renders))) as _ex2:
+                    _render_futs = {
+                        key: _ex2.submit(fn, *args, **kw)
+                        for key, (fn, args, kw) in _deferred_renders.items()
+                    }
+
+                try:
+                    if 'iq' in _render_futs:
+                        _iq_buf = _render_futs['iq'].result()
+                        _iq_img = _XLImage(_iq_buf); _iq_img.anchor = 'A' + str(max_iq_row + 2)
+                        ws_iq.add_image(_iq_img)
+                        _iq_buf.seek(0)
+                        _ov_iq_img = _XLImage(_io.BytesIO(_iq_buf.read()))
+                        _ov_iq_img.anchor = _ov_chart2_anchor
+                        ws_overview.add_image(_ov_iq_img)
+                except Exception as _e2:
+                    print(f"  Warning: Inventory quality chart skipped: {_e2}")
+
+                try:
+                    if 't10' in _render_futs:
+                        _t10_buf = _render_futs['t10'].result()
+                        _t10_img = _XLImage(_t10_buf); _t10_img.anchor = _t10_anchor_dedicated
+                        ws_t10.add_image(_t10_img)
+                        _t10_buf.seek(0)
+                        _ov_t10_img = _XLImage(_io.BytesIO(_t10_buf.read()))
+                        _ov_t10_img.anchor = _ov_chart3_anchor
+                        ws_overview.add_image(_ov_t10_img)
+                except Exception as _e3:
+                    print(f"  Warning: Top 10 chart skipped: {_e3}")
+
+                try:
+                    if 'scat' in _render_futs and _ws_mom is not None:
+                        _scat_img = _XLImage(_render_futs['scat'].result())
+                        _scat_img.anchor = 'J2'
+                        _ws_mom.add_image(_scat_img)
+                except Exception as _e_scat:
+                    print(f"  Warning: MoM scatter chart skipped: {_e_scat}")
 
             # ===== Reorder sheets to match VBA workbook tab order =====
             _desired_order = [
@@ -932,6 +998,7 @@ class PlanningEngine:
             and the Starting stock column also receives this format.
 
         Rules applied:
+        • Per-line-type row background via CF FormulaRule (replaces 50k cell.fill ops)
         • #,##0 (Planning) / #,##0.00 (Values_Planning) number format on data columns
         • 0.0% format on Line 10 (Utilization rate) data cells
         • Dynamic CF: red (FFC7CE) on L04 < 0, L10 > 100%; orange (FFC896) on L10 < 30%
@@ -941,43 +1008,46 @@ class PlanningEngine:
         • Dotted top border between material-group boundaries
         """
         from openpyxl.styles import PatternFill, Font, Border, Side
-        from openpyxl.formatting.rule import CellIsRule
+        from openpyxl.formatting.rule import CellIsRule, FormulaRule
+        from openpyxl.utils import get_column_letter as _gcl
         import re
 
-        bold_font   = Font(bold=True)
-        # Dynamic CF fills (written as rules, not static fills)
-        cf_red    = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')
-        cf_orange = PatternFill(start_color='FFC896', end_color='FFC896', fill_type='solid')
-        cf_purple = PatternFill(start_color='C8A2C8', end_color='C8A2C8', fill_type='solid')
-        dotted      = Side(border_style='dotted', color='000000')
+        bold_font = Font(bold=True)
+        dotted    = Side(border_style='dotted', color='000000')
+        dot_border = Border(top=dotted)
 
         def _pf(hex_color):
             return PatternFill(start_color=hex_color, end_color=hex_color, fill_type='solid')
 
-        # Per-line-type row fills (VBA extracted_vba.txt lines 5630–5904)
+        # Per-line-type fills applied as CF FormulaRules (worksheet-level, not per-cell)
         line_type_colors = {
-            '01. Demand forecast':        _pf('E2EFDA'),  # light green
-            '02. Dependent demand':       _pf('EDEDED'),  # light grey
-            '03. Total demand':           _pf('DAEEF3'),  # light blue
-            '04. Inventory':              _pf('FFF2CC'),  # light yellow
-            '05. Minimum target stock':   _pf('E2EFDA'),  # light green
-            '06. Production plan':        _pf('FCE4D6'),  # light peach
-            '06. Purchase receipt':       _pf('FCE4D6'),  # light peach
-            '07. Purchase plan':          _pf('D9E1F2'),  # light blue-grey
-            '07. Capacity utilization':   _pf('D9E1F2'),  # light blue-grey
-            '08. Dependent requirements': _pf('F2F2F2'),  # very light grey
-            '09. Available capacity':     _pf('E2EFDA'),  # light green
-            '10. Utilization rate':       _pf('FCE4D6'),  # light peach
-            '11. Shift availability':     _pf('D9D9D9'),  # medium grey
-            '12. FTE requirements':       _pf('FFF2CC'),  # light yellow
+            '01. Demand forecast':        'E2EFDA',
+            '02. Dependent demand':       'EDEDED',
+            '03. Total demand':           'DAEEF3',
+            '04. Inventory':              'FFF2CC',
+            '05. Minimum target stock':   'E2EFDA',
+            '06. Production plan':        'FCE4D6',
+            '06. Purchase receipt':       'FCE4D6',
+            '07. Purchase plan':          'D9E1F2',
+            '07. Capacity utilization':   'D9E1F2',
+            '08. Dependent requirements': 'F2F2F2',
+            '09. Available capacity':     'E2EFDA',
+            '10. Utilization rate':       'FCE4D6',
+            '11. Shift availability':     'D9D9D9',
+            '12. FTE requirements':       'FFF2CC',
         }
 
+        # Dynamic CF fills
+        cf_red    = _pf('FFC7CE')
+        cf_orange = _pf('FFC896')
+        cf_purple = _pf('C8A2C8')
+
         total_cols = ws.max_column
+        total_rows = ws.max_row
         period_re  = re.compile(r'^\d{4}-\d{2}$')
+        num_fmt    = '#,##0.00' if is_values_sheet else '#,##0'
 
-        num_fmt = '#,##0.00' if is_values_sheet else '#,##0'
-
-        # Locate key columns by reading the header row
+        # --- Pass 1: locate key columns from header row ---
         line_type_col = mat_num_col = data_col_start = starting_stock_col = None
         aux_col_idx = aux2_col_idx = None
         for cell in ws[1]:
@@ -998,10 +1068,13 @@ class PlanningEngine:
         if line_type_col is None:
             return
         if data_col_start is None:
-            data_col_start = total_cols + 1  # no period columns found
+            data_col_start = total_cols + 1
 
-        # Convert period header text strings to Excel date values with mm/yyyy format
-        # (VBA Add_Headers_Planningsheet line 4862: date value + mm/yyyy NumberFormat)
+        end_letter   = _gcl(total_cols)
+        lt_letter    = _gcl(line_type_col)
+        full_range   = f'A2:{end_letter}{total_rows}'
+
+        # --- Convert period headers to date values ---
         from datetime import datetime as _dt
         for cell in ws[1]:
             hdr = str(cell.value or '')
@@ -1012,11 +1085,23 @@ class PlanningEngine:
                 except ValueError:
                     pass
 
-        prev_mat = None
-        _cf_l04_rows = []
-        _cf_l09_rows = []
-        _cf_l10_rows = []
-        for excel_row in range(2, ws.max_row + 1):
+        # --- Apply line-type fills as CF FormulaRules (14 rules vs 50k cell ops) ---
+        for lt_val, hex_color in line_type_colors.items():
+            ws.conditional_formatting.add(
+                full_range,
+                FormulaRule(
+                    formula=[f'${lt_letter}2="{lt_val}"'],
+                    fill=_pf(hex_color),
+                )
+            )
+
+        # --- Pass 2: single column loop per row for font/format/border ---
+        prev_mat        = None
+        _cf_l04_rows    = []
+        _cf_l09_rows    = []
+        _cf_l10_rows    = []
+
+        for excel_row in range(2, total_rows + 1):
             lt  = ws.cell(row=excel_row, column=line_type_col).value
             mat = ws.cell(row=excel_row, column=mat_num_col).value if mat_num_col else None
 
@@ -1025,16 +1110,12 @@ class PlanningEngine:
             is_l09 = lt == '09. Available capacity'
             is_l10 = lt == '10. Utilization rate'
 
-            # Dotted top border at material-group boundaries
+            # Dotted top border at material-group boundaries (shared Border object)
             if mat is not None and mat != prev_mat and excel_row > 2:
                 for col in range(1, total_cols + 1):
-                    c = ws.cell(row=excel_row, column=col)
-                    b = c.border
-                    c.border = Border(top=dotted, bottom=b.bottom,
-                                      left=b.left, right=b.right)
+                    ws.cell(row=excel_row, column=col).border = dot_border
             prev_mat = mat
 
-            # Collect rows for dynamic CF (second pass)
             if is_l04:
                 _cf_l04_rows.append(excel_row)
             elif is_l09:
@@ -1042,29 +1123,18 @@ class PlanningEngine:
             elif is_l10 and str(mat or '').startswith('Z_'):
                 _cf_l10_rows.append(excel_row)
 
-            # Apply per-line-type row fill to all columns
-            row_fill = line_type_colors.get(str(lt or ''))
-            if row_fill:
-                for _c in range(1, total_cols + 1):
-                    ws.cell(row=excel_row, column=_c).fill = row_fill
-
+            # Single pass over columns: font, number format only (no fill)
             for col in range(1, total_cols + 1):
                 cell = ws.cell(row=excel_row, column=col)
-                is_data = col >= data_col_start
 
-                # Bold for Total demand rows (all columns)
                 if is_l03:
                     cell.font = bold_font
 
-                # Apply number format to Starting stock column even though it's not a period
                 if starting_stock_col and col == starting_stock_col:
                     cell.number_format = num_fmt
 
-                # VBA FIX 7: Aux columns store exact float, display with #,##0
-                # Exception: Line 10 Aux Column uses "0%" (VBA AddVisualsToMaterials)
                 if (aux_col_idx and col == aux_col_idx) or \
                         (aux2_col_idx and col == aux2_col_idx):
-                    # Coerce string-wrapped numbers to float so number_format works
                     if isinstance(cell.value, str):
                         try:
                             cell.value = float(cell.value)
@@ -1077,14 +1147,11 @@ class PlanningEngine:
                             cell.number_format = '0%'
                         else:
                             cell.number_format = num_fmt
-
-                if not is_data:
                     continue
 
-                val     = cell.value
-                num_val = val if isinstance(val, (int, float)) else None
+                if col < data_col_start:
+                    continue
 
-                # Number format
                 if is_l10:
                     cell.number_format = '0.0%'
                 elif is_l09:
@@ -1092,30 +1159,24 @@ class PlanningEngine:
                 else:
                     cell.number_format = num_fmt
 
-        # Dynamic conditional formatting (VBA ApplyConditionalFormatting line 4144)
-        if data_col_start is not None and data_col_start <= total_cols:
-            from openpyxl.utils import get_column_letter as _gcl
+        # --- Dynamic CF: value-based rules for data columns ---
+        if data_col_start <= total_cols:
             start_letter = _gcl(data_col_start)
-            end_letter   = _gcl(total_cols)
 
-            # L10 production rows: red >100%, orange <30% (VBA lines 4189-4198)
             for _rn in _cf_l10_rows:
                 _rng = f'{start_letter}{_rn}:{end_letter}{_rn}'
                 ws.conditional_formatting.add(_rng, CellIsRule(operator='greaterThan', formula=['1'],   fill=cf_red))
                 ws.conditional_formatting.add(_rng, CellIsRule(operator='lessThan',    formula=['0.3'], fill=cf_orange))
 
-            # L04 rows: red <0 (VBA lines 4208-4213)
             for _rn in _cf_l04_rows:
                 _rng = f'{start_letter}{_rn}:{end_letter}{_rn}'
                 ws.conditional_formatting.add(_rng, CellIsRule(operator='lessThan', formula=['0'], fill=cf_red))
 
-            # L09 rows: purple <1 — availability stored as 0.0-1.0 (VBA lines 4236-4241)
             for _rn in _cf_l09_rows:
                 _rng = f'{start_letter}{_rn}:{end_letter}{_rn}'
                 ws.conditional_formatting.add(_rng, CellIsRule(operator='lessThan', formula=['1'], fill=cf_purple))
 
-        # ---- Column widths ----
-        from openpyxl.utils import get_column_letter as _gcl_w
+        # --- Column widths ---
         _named_widths = {
             'Material number': 18, 'Material name': 22, 'Line type': 22,
             'Product type': 14, 'Product family': 14, 'SPC product': 14,
@@ -1125,9 +1186,9 @@ class PlanningEngine:
         for _hcell in ws[1]:
             _hw = _named_widths.get(str(_hcell.value or ''))
             if _hw:
-                ws.column_dimensions[_gcl_w(_hcell.column)].width = _hw
+                ws.column_dimensions[_gcl(_hcell.column)].width = _hw
             elif data_col_start is not None and _hcell.column >= data_col_start:
-                ws.column_dimensions[_gcl_w(_hcell.column)].width = 12
+                ws.column_dimensions[_gcl(_hcell.column)].width = 12
 
     def _apply_consol_colors(self, ws):
         """Apply VBA-matching colors and bold to ZZZZZZ_ consolidation rows on Values_Planning sheet."""
