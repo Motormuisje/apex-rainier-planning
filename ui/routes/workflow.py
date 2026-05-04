@@ -9,7 +9,7 @@ from typing import Callable
 
 from flask import Blueprint, jsonify, render_template, request
 
-from modules.planning_engine import PlanningEngine
+from modules.planning_engine import PlanningEngine, invalidate_data_cache
 
 
 def create_workflow_blueprint(
@@ -221,6 +221,7 @@ def _upload_multi_file(
         base_file_path = out_upload_dir / base_file.filename
         try:
             base_file.save(str(base_file_path))
+            invalidate_data_cache(str(base_file_path))
         except Exception as exc:
             return jsonify(classify_upload_exception(exc, 'opslaan base-file')), 400
     elif global_config.get('master_file') and Path(global_config['master_file']).exists():
@@ -351,6 +352,7 @@ def _upload_single_file(
     file_path = out_upload_dir / upload.filename
     try:
         upload.save(str(file_path))
+        invalidate_data_cache(str(file_path))
     except Exception as exc:
         return jsonify(classify_upload_exception(exc, 'opslaan upload')), 400
 
