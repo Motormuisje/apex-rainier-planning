@@ -102,6 +102,8 @@ def rebuild_volume_caches_from_results(current_engine) -> None:
         r.material_number: dict(r.values)
         for r in current_engine.results.get(LineType.PURCHASE_RECEIPT.value, [])
     }
+    if hasattr(current_engine, 'rebuild_machine_output_caches'):
+        current_engine.rebuild_machine_output_caches()
     current_engine._iq_cache = None
 
 

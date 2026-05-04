@@ -25,8 +25,55 @@ def create_sessions_blueprint(
     snapshot_has_manual_edits: Callable[[dict], bool],
     engine_has_manual_edits: Callable[[object], bool],
     app_context: Callable[[], contextlib.AbstractContextManager],
+    start_session_warmup: Callable[[str], bool] | None = None,
+    wait_for_session_warmup: Callable[[str, float], bool] | None = None,
 ) -> Blueprint:
     bp = Blueprint('sessions', __name__)
+
+    def _session_is_calculated(sess: dict) -> bool:
+        return sess.get('engine') is not None or sess.get('parameters') is not None
+
+    def _session_restore_status(sess: dict) -> str:
+        if sess.get('engine') is not None:
+            return 'ready'
+        return sess.get('restore_status') or ('cold' if sess.get('parameters') is not None else 'pending')
+
+    def _session_meta_payload(sid: str, sess: dict, active_session_id: str | None = None) -> dict:
+        meta = sess.get('metadata', {})
+        site = meta.get('site', 'Unknown')
+        planning_month = str(meta.get('planning_month', '')) or 'Unknown'
+        return {
+            'id': sid,
+            'filename': sess.get('filename', ''),
+            'custom_name': sess.get('custom_name'),
+            'site': site,
+            'planning_month': planning_month,
+            'uploaded_at': sess.get('uploaded_at', ''),
+            'calculated': _session_is_calculated(sess),
+            'is_snapshot': sess.get('is_snapshot', False),
+            'active': sid == active_session_id,
+            'metadata': meta,
+            'restore_status': _session_restore_status(sess),
+            'restore_error': sess.get('restore_error'),
+        }
+
+    def _switch_payload(sid: str, sess: dict) -> dict:
+        return {
+            'success': True,
+            'active_session_id': sid,
+            'filename': sess.get('filename', ''),
+            'custom_name': sess.get('custom_name'),
+            'metadata': sess.get('metadata', {}),
+            'calculated': sess.get('engine') is not None,
+            'restore_status': _session_restore_status(sess),
+            'restore_error': sess.get('restore_error'),
+            'pending_edits': sess.get('pending_edits', {}),
+            'value_aux_overrides': sess.get('value_aux_overrides', {}),
+            'machine_overrides': sess.get('machine_overrides', {}),
+            'parameters': sess.get('parameters', {}),
+            'valuation_params': global_config.get('valuation_params', {}),
+            'purchased_and_produced': global_config.get('purchased_and_produced', ''),
+        }
 
     @bp.route('/api/sessions/snapshot', methods=['POST'])
     def snapshot_session():
@@ -41,10 +88,6 @@ def create_sessions_blueprint(
             return jsonify({'error': 'No active session'}), 400
 
         new_id = str(uuid.uuid4())
-        try:
-            engine_copy = copy.deepcopy(sess.get('engine')) if sess.get('engine') is not None else None
-        except Exception:
-            engine_copy = None
         new_sess = {
             'id': new_id,
             'file_path': sess.get('file_path', ''),
@@ -52,13 +95,17 @@ def create_sessions_blueprint(
             'filename': sess.get('filename', ''),
             'custom_name': name,
             'is_snapshot': True,
-            'engine': engine_copy,
+            'engine': None,
             'value_results': copy.deepcopy(sess.get('value_results', {})),
             'metadata': copy.deepcopy(sess.get('metadata', {})),
             'uploaded_at': datetime.now().isoformat(),
             'parameters': copy.deepcopy(sess.get('parameters')),
             'pending_edits': copy.deepcopy(sess.get('pending_edits', {})),
             'value_aux_overrides': copy.deepcopy(sess.get('value_aux_overrides', {})),
+            'valuation_params': copy.deepcopy(
+                sess.get('valuation_params')
+                or (sess.get('reset_baseline') or {}).get('valuation_params')
+            ),
             'machine_overrides': (
                 machine_overrides_from_engine(sess, sess.get('engine'))
                 if sess.get('engine') is not None
@@ -67,27 +114,25 @@ def create_sessions_blueprint(
             'reset_baseline': copy.deepcopy(sess.get('reset_baseline')),
             'undo_stack': [],
             'redo_stack': [],
+            'restore_status': 'cold',
+            'restore_error': None,
         }
         sessions[new_id] = new_sess
+        if start_session_warmup is not None and new_sess.get('parameters') is not None:
+            new_sess['restore_status'] = 'warming'
+            try:
+                if not start_session_warmup(new_id):
+                    new_sess['restore_status'] = 'cold'
+            except Exception as exc:
+                new_sess['restore_status'] = 'failed'
+                new_sess['restore_error'] = str(exc)
         save_sessions_to_disk()
 
-        meta = new_sess.get('metadata', {})
-        site = meta.get('site', 'Unknown')
-        planning_month = str(meta.get('planning_month', '')) or 'Unknown'
+        session_payload = _session_meta_payload(new_id, new_sess)
+        session_payload['custom_name'] = name
         return jsonify({
             'success': True,
-            'session': {
-                'id': new_id,
-                'filename': new_sess['filename'],
-                'custom_name': name,
-                'site': site,
-                'planning_month': planning_month,
-                'uploaded_at': new_sess['uploaded_at'],
-                'calculated': engine_copy is not None,
-                'is_snapshot': True,
-                'active': False,
-                'metadata': meta,
-            }
+            'session': session_payload,
         })
 
     @bp.route('/api/sessions')
@@ -103,18 +148,7 @@ def create_sessions_blueprint(
             month = planning_month[5:7] if len(planning_month) >= 7 else 'Unknown'
             key = f'{year}/{month}/{site}'
             grouped.setdefault(key, [])
-            grouped[key].append({
-                'id': sid,
-                'filename': sess.get('filename', ''),
-                'custom_name': sess.get('custom_name'),
-                'site': site,
-                'planning_month': planning_month,
-                'uploaded_at': sess.get('uploaded_at', ''),
-                'calculated': sess.get('engine') is not None,
-                'is_snapshot': sess.get('is_snapshot', False),
-                'active': sid == active_session_id,
-                'metadata': meta,
-            })
+            grouped[key].append(_session_meta_payload(sid, sess, active_session_id))
         return jsonify({'active_session_id': active_session_id, 'groups': grouped})
 
     @bp.route('/api/sessions/rename', methods=['POST'])
@@ -140,7 +174,9 @@ def create_sessions_blueprint(
                 'metadata': sess.get('metadata', {}),
                 'uploaded_at': sess.get('uploaded_at', ''),
                 'planning_month': (sess.get('metadata') or {}).get('planning_month', ''),
-                'calculated': sess.get('engine') is not None,
+                'calculated': _session_is_calculated(sess),
+                'restore_status': _session_restore_status(sess),
+                'restore_error': sess.get('restore_error'),
             }
         })
 
@@ -155,8 +191,16 @@ def create_sessions_blueprint(
 
         if sess.get('engine') is not None:
             sync_global_config_from_engine(sess.get('engine'))
+        if sess.get('engine') is None and _session_restore_status(sess) == 'warming':
+            if wait_for_session_warmup is not None:
+                wait_for_session_warmup(sid, 0.1)
+            if sess.get('engine') is None:
+                set_active_session_id(sid)
+                return jsonify(_switch_payload(sid, sess))
         if sess.get('engine') is None and sess.get('parameters') is not None:
             try:
+                sess['restore_status'] = 'warming'
+                sess['restore_error'] = None
                 params = sess['parameters']
                 with contextlib.redirect_stdout(io.StringIO()):
                     engine = build_clean_engine_for_session(sess, params)
@@ -164,7 +208,10 @@ def create_sessions_blueprint(
                     with app_context():
                         replay_pending_edits(sess, engine)
                 sess['engine'] = engine
+                sess['restore_status'] = 'ready'
             except Exception as exc:
+                sess['restore_status'] = 'failed'
+                sess['restore_error'] = str(exc)
                 return jsonify({'error': f'Could not restore calculations for this session: {exc}'}), 500
         if sess.get('engine') is not None and (
             sess.get('reset_baseline') is None or snapshot_has_manual_edits(sess.get('reset_baseline'))
@@ -181,20 +228,7 @@ def create_sessions_blueprint(
         set_active_session_id(sid)
         sync_global_config_from_engine(sess.get('engine'))
 
-        return jsonify({
-            'success': True,
-            'active_session_id': sid,
-            'filename': sess.get('filename', ''),
-            'custom_name': sess.get('custom_name'),
-            'metadata': sess.get('metadata', {}),
-            'calculated': sess.get('engine') is not None,
-            'pending_edits': sess.get('pending_edits', {}),
-            'value_aux_overrides': sess.get('value_aux_overrides', {}),
-            'machine_overrides': sess.get('machine_overrides', {}),
-            'parameters': sess.get('parameters', {}),
-            'valuation_params': global_config.get('valuation_params', {}),
-            'purchased_and_produced': global_config.get('purchased_and_produced', ''),
-        })
+        return jsonify(_switch_payload(sid, sess))
 
     @bp.route('/api/sessions/<session_id>', methods=['DELETE'])
     def delete_session(session_id):

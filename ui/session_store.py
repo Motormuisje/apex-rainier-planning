@@ -92,6 +92,8 @@ def load_sessions_from_disk(sessions_store: Path) -> tuple[dict, str | None]:
                 'valuation_params': data.get('valuation_params'),
                 'undo_stack': [],
                 'redo_stack': [],
+                'restore_status': 'cold' if data.get('parameters') is not None else 'pending',
+                'restore_error': None,
             }
         saved_active = store.get('active_session_id')
         if saved_active and saved_active in loaded_sessions:

@@ -111,10 +111,14 @@ class InventoryQualityEngine:
             periods_data[period] = cat
 
         mat = self.data.materials.get(mat_num)
-        overstock_by_period = {p: periods_data[p]['overstock'] for p in self.periods}
         starting_inv = getattr(row, 'starting_stock', 0.0) or 0.0
-        starting_overstock = max(0.0, starting_inv - target_val - lot_val)
-        overstock_by_period['Starting stock'] = round(starting_overstock, 2)
+        starting_cat = self._categorize_period(
+            starting_inv, safety_val, strategic_val, target_val, lot_val, mat_num, 'Starting stock'
+        )
+        periods_data['Starting stock'] = starting_cat
+
+        overstock_by_period = {p: periods_data[p]['overstock'] for p in self.periods}
+        overstock_by_period['Starting stock'] = starting_cat['overstock']
 
         return {
             'material_number': mat_num,
@@ -124,7 +128,7 @@ class InventoryQualityEngine:
             'unit_value': round(unit_val, 4),
             'total_overstock': round(mat_total_overstock, 2),
             'total_inventory': round(mat_total_inventory, 2),
-            'starting_overstock': round(starting_overstock, 2),
+            'starting_overstock': starting_cat['overstock'],
             'periods': periods_data,
             'overstock_by_period': overstock_by_period,
         }
@@ -143,6 +147,8 @@ class InventoryQualityEngine:
         for m in per_material:
             total_overstock += m['total_overstock']
             for p, vals in m['periods'].items():
+                if p not in period_totals:
+                    continue
                 for cat in ('under', 'safety', 'strategic', 'normal', 'overstock', 'inventory'):
                     period_totals[p][cat] = round(period_totals[p][cat] + vals[cat], 2)
 

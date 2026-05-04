@@ -9,11 +9,103 @@ from modules.database_exporter import DatabaseExporter
 from modules.mom_comparison_engine import MoMComparisonEngine
 
 
+def _apply_edit_highlights(path: str, engine):
+    """Open the exported workbook and apply edit highlights + summary sheet."""
+    import openpyxl
+    from openpyxl.styles import PatternFill, Font
+    from openpyxl.comments import Comment
+
+    # Collect all edits
+    all_edits = []
+    for _, rows in engine.results.items():
+        for row in rows:
+            if row.manual_edits:
+                for period, edit_data in row.manual_edits.items():
+                    original = edit_data.get('original', 0.0)
+                    new_val = edit_data.get('new', 0.0)
+                    delta_pct = round((new_val - original) / abs(original) * 100, 2) if original != 0 else 0.0
+                    all_edits.append({
+                        'line_type': row.line_type,
+                        'material_number': row.material_number,
+                        'material_name': row.material_name,
+                        'period': period,
+                        'original': original,
+                        'new': new_val,
+                        'delta_pct': delta_pct,
+                    })
+
+    if not all_edits:
+        return
+
+    wb = openpyxl.load_workbook(path)
+    ws = wb['Planning sheet']
+
+    # Build column lookups from header row
+    header = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+    period_col = {}
+    mat_col_idx = None
+    lt_col_idx = None
+    for i, val in enumerate(header, start=1):
+        if val is None:
+            continue
+        s = str(val)
+        period_col[s] = i
+        if s == 'Material number':
+            mat_col_idx = i
+        elif s == 'Line type':
+            lt_col_idx = i
+
+    # Build row lookup: (material_number, line_type) -> row_idx
+    row_lookup = {}
+    if mat_col_idx and lt_col_idx:
+        for row_idx, row_data in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+            mat_val = row_data[mat_col_idx - 1]
+            lt_val = row_data[lt_col_idx - 1]
+            if mat_val and lt_val:
+                row_lookup[(str(mat_val), str(lt_val))] = row_idx
+
+    # Fill styles
+    yellow_fill = PatternFill(start_color='FFEB3B', end_color='FFEB3B', fill_type='solid')
+    green_fill = PatternFill(start_color='C8E6C9', end_color='C8E6C9', fill_type='solid')
+    red_fill = PatternFill(start_color='FFCDD2', end_color='FFCDD2', fill_type='solid')
+    bold_font = Font(bold=True)
+
+    for edit in all_edits:
+        row_idx = row_lookup.get((edit['material_number'], edit['line_type']))
+        col_idx = period_col.get(edit['period'])
+        if row_idx is None or col_idx is None:
+            continue
+        cell = ws.cell(row=row_idx, column=col_idx)
+        original = edit['original']
+        new_val = edit['new']
+        delta_pct = edit['delta_pct']
+        if new_val > original:
+            cell.fill = green_fill
+            cell.font = bold_font
+        elif new_val < original:
+            cell.fill = red_fill
+            cell.font = bold_font
+        else:
+            cell.fill = yellow_fill
+        cell.comment = Comment(f"Original: {original}\nNew: {new_val}\nDelta: {delta_pct}%", 'SOP Engine')
+
+    # Edits Summary sheet
+    if 'Edits Summary' in wb.sheetnames:
+        del wb['Edits Summary']
+    ws_edits = wb.create_sheet('Edits Summary')
+    ws_edits.append(['Line Type', 'Material Number', 'Material Name', 'Period',
+                     'Original Value', 'New Value', 'Delta %'])
+    for edit in all_edits:
+        ws_edits.append([edit['line_type'], edit['material_number'], edit['material_name'],
+                         edit['period'], edit['original'], edit['new'], edit['delta_pct']])
+
+    wb.save(path)
+
+
 def create_exports_blueprint(
     get_active: Callable[[], tuple],
     export_dir: Callable[[], object],
     cycle_manager: Callable[[], object],
-    apply_edit_highlights: Callable[[str, object], None],
 ) -> Blueprint:
     bp = Blueprint('exports', __name__)
 
@@ -59,7 +151,7 @@ def create_exports_blueprint(
             inventory_quality_engine=inventory_quality_engine,
             previous_cycle_df=previous_df,
         )
-        apply_edit_highlights(str(export_path), current_engine)
+        _apply_edit_highlights(str(export_path), current_engine)
 
         return send_file(str(export_path), as_attachment=True)
 

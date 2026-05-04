@@ -8,6 +8,7 @@
     <link rel="shortcut icon" href="/static/favicon.ico" type="image/x-icon">
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2/dist/chartjs-plugin-datalabels.min.js"></script>
     <style>
         body { background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); min-height: 100vh; }
         .card { background: rgba(30, 41, 59, 0.8); border: 1px solid rgba(255, 255, 255, 0.1); }
@@ -1114,7 +1115,7 @@
                             <button id="machEditModeBtn" onclick="toggleMachineEditMode()" class="edit-mode-btn px-3 py-1 rounded text-xs border" style="background:rgba(180,130,0,0.18);color:#fcd34d;border-color:rgba(202,138,4,0.40);" title="Activeer bewerkingsmodus voor OEE, beschikbaarheid en shift-uren (Ctrl+E)">&#9998; Bewerken</button>
                             <button id="machinesUndoBtn"  onclick="undoMachineEdit()"  class="px-3 py-1 text-xs rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-40" disabled title="Maak de laatste machine-bewerking ongedaan (Ctrl+Z)">&#8630; Undo</button>
                             <button id="machinesRedoBtn"  onclick="redoMachineEdit()"  class="px-3 py-1 text-xs rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-40" disabled title="Herstel de laatste ongedaan gemaakte bewerking (Ctrl+Y)">&#8631; Redo</button>
-                            <button id="machinesResetBtn" onclick="resetMachineEdits()" class="px-3 py-1 text-xs rounded bg-slate-700 hover:bg-slate-600" title="Zet OEE en beschikbaarheid terug naar de waarden van de laatste Calculate">Reset</button>
+                            <button id="machinesResetBtn" onmousedown="event.preventDefault(); resetMachineEdits()" onclick="event.preventDefault()" class="px-3 py-1 text-xs rounded bg-slate-700 hover:bg-slate-600" title="Zet OEE, beschikbaarheid en shift-uren terug naar de waarden van de laatste Calculate">Reset</button>
                         </div>
                     </div>
                 </div>
@@ -1451,7 +1452,7 @@
     <div id="ltInfoTooltip"></div>
 <script src="{{ url_for('static', filename='sop_planning.js') }}?v=20260412w"></script>
 <script>
-let state = { periods: [], results: null, lineTypes: [], valueResults: null, valueLineTypes: [], consolidation: [], cellEdits: {}, valueAuxEdits: {}, valueRowDeltas: {}, demandTurnoverDeltas: {}, top10Overstocks: [], activeSessionId: null, dashboardDirty: false, moqRawNeeds: {}, machineDeltaSummary: null };
+let state = { periods: [], results: null, lineTypes: [], valueResults: null, valueLineTypes: [], consolidation: [], cellEdits: {}, valueAuxEdits: {}, valueRowDeltas: {}, demandTurnoverDeltas: {}, top10Overstocks: [], activeSessionId: null, dashboardDirty: false, moqRawNeeds: {}, machineDeltaSummary: null, machineDeltaSummaries: {} };
 // Resize all Chart.js charts when window is restored from minimized state
 let _resizeTimer = null;
 window.addEventListener('resize', () => {
@@ -2231,8 +2232,7 @@ async function runCalc() {
     state.valueAuxEdits = {};
     state.valueRowDeltas = {};
     state.demandTurnoverDeltas = {};
-    state.machineDeltaSummary = null;
-    renderMachineDeltaSummary();
+    _setMachineDeltaSummary(null);
     updateEditBadge();
     log('Parameters: planning_month=' + planningMonth + ', months_actuals=' + monthsActuals + ', months_forecast=' + monthsForecast);
     try {
@@ -3189,11 +3189,24 @@ function renderKPIOverviewTable(financials, periods) {
     };
     const calcValFull = (data, n, key, pct) => {
         const p = periods.slice(0, n);
-        if (pct) {
+        // VBA: ROCE = EBIT_sum / CI_avg (not avg of per-period ROCE values)
+        if (key === 'ROCE') {
+            const ebitData = financials['EBIT'];
+            const ciData = financials['CAPITAL INVESTMENT'];
+            if (ebitData && ciData) {
+                const ebitSum = p.reduce((s, x) => s + (ebitData[x] || 0), 0);
+                const ciAvg = p.reduce((s, x) => s + (ciData[x] || 0), 0) / (p.length || 1);
+                return ciAvg !== 0 ? ebitSum / ciAvg : 0;
+            }
             const vals = p.map(x => data[x] || 0).filter(v => v !== 0);
             return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
         }
-        if (BALANCE.has(key)) return data[p[p.length - 1]] || 0;
+        // VBA: balance sheet items use AVERAGE; INVENTORY VALUE includes starting stock
+        if (BALANCE.has(key)) {
+            const pts = key === 'INVENTORY VALUE' ? ['Starting stock', ...p] : p;
+            const sum = pts.reduce((s, x) => s + (data[x] || 0), 0);
+            return pts.length ? sum / pts.length : 0;
+        }
         return p.reduce((s, x) => s + (data[x] || 0), 0);
     };
     const fmtEur = v => '€\u202f' + Math.round(v).toLocaleString('nl-NL');
@@ -3232,37 +3245,42 @@ function renderInvQualityChart(invQuality, periods, financials) {
     if (window._invQualityChart) { window._invQualityChart.destroy(); window._invQualityChart = null; }
     if (!invQuality || !invQuality.length || !periods.length) return;
 
-    // Aggregate across all materials per period
+    // Aggregate across all materials per period, including starting stock
+    const allPeriods = ['Starting stock', ...periods];
     const agg = { under:{}, safety:{}, strategic:{}, normal:{}, overstock:{}, inventory:{} };
     for (const mat of invQuality) {
-        for (const p of periods) {
+        for (const p of allPeriods) {
             const d = (mat.periods && mat.periods[p]) || {};
-            agg.under[p]     = (agg.under[p]     || 0) + Math.abs(d.under     || 0);
-            agg.safety[p]    = (agg.safety[p]     || 0) + Math.abs(d.safety    || 0);
-            agg.strategic[p] = (agg.strategic[p]  || 0) + Math.abs(d.strategic || 0);
-            agg.normal[p]    = (agg.normal[p]     || 0) + Math.abs(d.normal    || 0);
-            agg.overstock[p] = (agg.overstock[p]  || 0) + Math.abs(d.overstock || 0);
+            agg.under[p]     = (agg.under[p]     || 0) + (d.under     || 0);
+            agg.safety[p]    = (agg.safety[p]     || 0) + (d.safety    || 0);
+            agg.strategic[p] = (agg.strategic[p]  || 0) + (d.strategic || 0);
+            agg.normal[p]    = (agg.normal[p]     || 0) + (d.normal    || 0);
+            agg.overstock[p] = (agg.overstock[p]  || 0) + (d.overstock || 0);
             agg.inventory[p] = (agg.inventory[p]  || 0) + (d.inventory || 0);
         }
     }
 
-    const labels = ['Starting stock', ...periods];
-    const toData = obj => [0, ...periods.map(p => (obj[p] || 0) / 1000)];
+    const labels = allPeriods;
+    const toData = obj => allPeriods.map(p => (obj[p] || 0) / 1000);
     const cogData = financials && financials['COST OF GOODS']
-        ? [0, ...periods.map(p => (financials['COST OF GOODS'][p] || 0) / 1000)]
+        ? allPeriods.map(p => p === 'Starting stock' ? null : (financials['COST OF GOODS'][p] || 0) / 1000)
         : null;
 
     const datasets = [
-        { label: 'Understock',    data: toData(agg.under),     backgroundColor: 'rgba(220,38,38,0.85)',  stack: 'inv' },
-        { label: 'Safety stock',  data: toData(agg.safety),    backgroundColor: 'rgba(21,128,61,0.85)',  stack: 'inv' },
-        { label: 'Strategic',     data: toData(agg.strategic), backgroundColor: 'rgba(217,119,6,0.85)',  stack: 'inv' },
-        { label: 'Normal',        data: toData(agg.normal),    backgroundColor: 'rgba(234,179,8,0.85)',  stack: 'inv' },
-        { label: 'Overstock',     data: toData(agg.overstock), backgroundColor: 'rgba(248,113,113,0.85)',stack: 'inv' },
-        { label: 'Actual stock',  data: toData(agg.inventory), type: 'line', borderColor: '#a855f7', backgroundColor: 'transparent', borderWidth: 2, pointRadius: 2, fill: false, stack: undefined },
+        { label: 'Understock',    data: toData(agg.under),     backgroundColor: 'rgba(220,38,38,0.85)',  stack: 'under', order: 2 },
+        { label: 'Safety stock',  data: toData(agg.safety),    backgroundColor: 'rgba(21,128,61,0.85)',  stack: 'inv',   order: 2 },
+        { label: 'Strategic',     data: toData(agg.strategic), backgroundColor: 'rgba(217,119,6,0.85)',  stack: 'inv',   order: 2 },
+        { label: 'Normal',        data: toData(agg.normal),    backgroundColor: 'rgba(234,179,8,0.85)',  stack: 'inv',   order: 2 },
+        { label: 'Overstock',     data: toData(agg.overstock), backgroundColor: 'rgba(248,113,113,0.85)',stack: 'inv',   order: 2 },
+        { label: 'Actual stock',  data: toData(agg.inventory), type: 'line', borderColor: '#a855f7', backgroundColor: 'transparent', borderWidth: 2, pointRadius: 2, fill: false, stack: 'line_actual', order: 1,
+          datalabels: { display: true, align: 'top', anchor: 'end', color: '#c4b5fd', font: { size: 8 },
+            formatter: v => v == null ? '' : Math.round(v * 1000).toLocaleString('nl-NL') } },
     ];
-    if (cogData) datasets.push({ label: 'Cost of Goods', data: cogData, type: 'line', borderColor: '#7dd3fc', backgroundColor: 'transparent', borderWidth: 1.5, pointRadius: 0, borderDash: [4,3], fill: false, stack: undefined });
+    if (cogData) datasets.push({ label: 'Cost of Goods', data: cogData, type: 'line', borderColor: '#7dd3fc', backgroundColor: 'transparent', borderWidth: 1.5, pointRadius: 3, pointBackgroundColor: '#7dd3fc', borderDash: [4,3], fill: false, stack: 'line_cog', spanGaps: false, order: 0,
+        datalabels: { display: false } });
 
     window._invQualityChart = new Chart(canvas.getContext('2d'), {
+        plugins: [ChartDataLabels],
         type: 'bar',
         data: { labels, datasets },
         options: {
@@ -3270,11 +3288,12 @@ function renderInvQualityChart(invQuality, periods, financials) {
             interaction: { mode: 'index', intersect: false },
             plugins: {
                 legend: { labels: { color: '#94a3b8', boxWidth: 10, font: { size: 9 } } },
-                tooltip: { callbacks: { label: ctx => ` ${ctx.dataset.label}: ${ctx.parsed.y.toFixed(0)}K` } }
+                tooltip: { callbacks: { label: ctx => ` ${ctx.dataset.label}: ${ctx.parsed.y.toFixed(0)}K` } },
+                datalabels: { display: false }
             },
             scales: {
                 x: { stacked: true, grid: { color: 'rgba(255,255,255,0.04)' }, ticks: { color: '#94a3b8', maxRotation: 30, font: { size: 9 } } },
-                y: { stacked: true, grid: { color: '#334155' }, ticks: { color: '#94a3b8', callback: v => v.toFixed(0) + 'K' } }
+                y: { stacked: true, beginAtZero: false, grace: '10%', grid: { color: '#334155' }, ticks: { color: '#94a3b8', callback: v => v.toFixed(0) + 'K' } }
             }
         }
     });
@@ -3329,6 +3348,7 @@ function renderFinancialChart(financials, periods) {
     if (!canvas) return;
     if (financialChart) { financialChart.destroy(); financialChart = null; }
     if (!financials || !periods.length) return;
+    const allPeriods = ['Starting stock', ...periods];
     const METRICS = [
         { key: 'TURNOVER',          color: '#22c55e',  label: 'Turnover' },
         { key: 'COST OF GOODS',     color: '#f97316',  label: 'Cost of Goods' },
@@ -3340,17 +3360,21 @@ function renderFinancialChart(financials, periods) {
         .filter(m => financials[m.key])
         .map(m => ({
             label: m.label,
-            data: periods.map(p => (financials[m.key][p] || 0) / 1000),
+            data: allPeriods.map(p => {
+                const v = financials[m.key][p];
+                return (v != null) ? v / 1000 : null;
+            }),
             borderColor: m.color,
             backgroundColor: m.color.replace('#', 'rgba(') + ',0.08)',  // fallback; overridden below
             borderWidth: 2,
             tension: 0.3,
             pointRadius: 3,
             fill: false,
+            spanGaps: false,
         }));
     financialChart = new Chart(canvas.getContext('2d'), {
         type: 'line',
-        data: { labels: periods, datasets },
+        data: { labels: allPeriods, datasets },
         options: {
             responsive: true,
             interaction: { mode: 'index', intersect: false },
@@ -3774,6 +3798,25 @@ function _mergeDeltaRows(deltaRows, { limit = 120 } = {}) {
       .slice(0, limit);
 }
 
+function _rememberMachineDeltaSummaryForSession(sessionId = state.activeSessionId) {
+    if (!sessionId) return;
+    if (state.machineDeltaSummary) state.machineDeltaSummaries[sessionId] = state.machineDeltaSummary;
+    else delete state.machineDeltaSummaries[sessionId];
+}
+
+function _setMachineDeltaSummary(summary) {
+    state.machineDeltaSummary = summary || null;
+    _rememberMachineDeltaSummaryForSession();
+    renderMachineDeltaSummary();
+}
+
+function _restoreMachineDeltaSummaryForSession(sessionId) {
+    state.machineDeltaSummary = (sessionId && state.machineDeltaSummaries[sessionId])
+        ? state.machineDeltaSummaries[sessionId]
+        : null;
+    renderMachineDeltaSummary();
+}
+
 function _buildMachineDeltaSummary(before, nextPayload, directChanges) {
     const periods = nextPayload.periods || state.periods || [];
     const nextPlanning = _snapshotRowsByKey(nextPayload.results || state.results, row => MACHINE_IMPACT_LINES.has(row.line_type));
@@ -3792,7 +3835,7 @@ function _buildMachineDeltaSummary(before, nextPayload, directChanges) {
     const allCascadeRows = _mergeDeltaRows(history.flatMap(h => h.cascadeRows || []), { limit: 100 });
     const allFinancialRows = _mergeDeltaRows(history.flatMap(h => h.financialRows || []), { limit: 60 });
     const biggestFinancial = allFinancialRows[0] || null;
-    state.machineDeltaSummary = {
+    _setMachineDeltaSummary({
         timestamp: event.timestamp,
         history,
         directChanges: allDirectChanges,
@@ -3801,8 +3844,7 @@ function _buildMachineDeltaSummary(before, nextPayload, directChanges) {
         lastCascadeRows: cascadeRows,
         lastFinancialRows: financialRows,
         biggestFinancial,
-    };
-    renderMachineDeltaSummary();
+    });
 }
 
 function _formatDeltaInline(row, maxPeriods = 3) {
@@ -5037,8 +5079,8 @@ async function refreshAllTabs() {
     state.dashboardDirty = false;
 }
 
-async function _refreshDerivedViews({ forceDashboard = false, refreshCapacity = true, refreshInventory = true } = {}) {
-    if (forceDashboard || state.dashboardDirty) {
+async function _refreshDerivedViews({ forceDashboard = false, refreshCapacity = true, refreshInventory = true, skipDashboard = false } = {}) {
+    if (!skipDashboard && (forceDashboard || state.dashboardDirty)) {
         await renderDashboard();
         state.dashboardDirty = false;
     }
@@ -5046,7 +5088,7 @@ async function _refreshDerivedViews({ forceDashboard = false, refreshCapacity = 
     if (refreshInventory) loadInventoryData();
 }
 
-async function _applyServerPayload(data, { prevValueSnapshot = null, deltaSource = 'config', skipDeltaRecording = false } = {}) {
+async function _applyServerPayload(data, { prevValueSnapshot = null, deltaSource = 'config', skipDeltaRecording = false, skipDashboard = false } = {}) {
     const hasPlanning = !!data.results;
     const hasValues = !!data.value_results;
 
@@ -5079,11 +5121,12 @@ async function _applyServerPayload(data, { prevValueSnapshot = null, deltaSource
 
     if (hasPlanning || hasValues) {
         updateEditBadge();
-        state.dashboardDirty = true;
+        if (!skipDashboard) state.dashboardDirty = true;
         await _refreshDerivedViews({
-            forceDashboard: true,
+            forceDashboard: !skipDashboard,
             refreshCapacity: hasPlanning,
             refreshInventory: hasPlanning,
+            skipDashboard,
         });
     }
 }
@@ -5240,7 +5283,7 @@ async function resetAllEdits() {
             state.valueAuxEdits = {};
             state.valueRowDeltas = {};
             state.demandTurnoverDeltas = {};
-            state.machineDeltaSummary = null;
+            _setMachineDeltaSummary(null);
             _editedRowsOnly = false;
             _planEditFilterMode = null;
             _editedMaterialScope = null;
@@ -6275,8 +6318,19 @@ let _machinesData = null;
 let _machinesUndoDepth = 0;
 let _machinesRedoDepth = 0;
 let _machineEditMode = false;
+let _machineOpInFlight = false;
+let _machineResetInFlight = false;
 let _machSlotCharts = [null, null];
 let _machDashChartRetries = new Set();
+
+async function _waitForMachineOpIdle(maxMs = 5000) {
+    const started = Date.now();
+    while (_machineOpInFlight) {
+        if (Date.now() - started > maxMs) return false;
+        await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    return true;
+}
 
 function _updateMachineButtons() {
     const undoBtn = document.getElementById('machinesUndoBtn');
@@ -6881,6 +6935,8 @@ function _removeDragPanel() {
 
 async function _applyDragChanges() {
     if (!_pendingDragApply) return;
+    if (_machineOpInFlight) return;
+    _machineOpInFlight = true;
     const { changes } = _pendingDragApply;
     const beforeImpact = _snapshotMachineImpactState();
     const directChanges = changes.map(c => ({
@@ -6891,27 +6947,32 @@ async function _applyDragChanges() {
         new_display: c.newOee.toFixed(1) + '%',
     }));
     _removeDragPanel();
-    let latest = null;
-    for (const c of changes) {
-        const res = await fetch('/api/machines/update', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ machine: c.code, field: 'oee', value: c.newOee / 100 })
-        });
-        latest = await res.json();
-        if (!res.ok) {
-            log('Machine update error: ' + (latest.error || res.status));
-            break;
+    try {
+        let latest = null;
+        for (const c of changes) {
+            const res = await fetch('/api/machines/update', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ machine: c.code, field: 'oee', value: c.newOee / 100 })
+            });
+            latest = await res.json();
+            if (!res.ok) {
+                log('Machine update error: ' + (latest.error || res.status));
+                break;
+            }
         }
-    }
-    if (latest && latest.success) {
-        _buildMachineDeltaSummary(beforeImpact, latest, directChanges);
-        await _applyServerPayload(latest, { deltaSource: 'plan', skipDeltaRecording: true });
-        _machinesUndoDepth = latest.undo_depth || 0;
-        _machinesRedoDepth = latest.redo_depth || 0;
-        _updateMachineButtons();
-    } else {
-        await _refreshDerivedViews({ forceDashboard: true, refreshCapacity: true, refreshInventory: false });
+        if (latest && latest.success) {
+            _buildMachineDeltaSummary(beforeImpact, latest, directChanges);
+            await _applyServerPayload(latest, { deltaSource: 'plan', skipDeltaRecording: true, skipDashboard: true });
+            _machinesUndoDepth = latest.undo_depth || 0;
+            _machinesRedoDepth = latest.redo_depth || 0;
+            _updateMachineButtons();
+            await loadMachinesData();
+        } else {
+            await _refreshDerivedViews({ forceDashboard: true, refreshCapacity: true, refreshInventory: false });
+        }
+    } finally {
+        _machineOpInFlight = false;
     }
 }
 
@@ -6925,6 +6986,7 @@ function renderFteTable() {
     }
     const periods = _machinesData.periods || [];
     const groups = _machinesData.groups || [];
+    const fteExtra = _machinesData.fte_extra || [];
     const fteTotals = _machinesData.fte_totals_by_period || {};
 
     head.innerHTML = `
@@ -6944,6 +7006,16 @@ function renderFteTable() {
         </tr>`;
     }).join('');
 
+    const extraRows = fteExtra.map(g => {
+        const per = g.fte_by_period || {};
+        const cells = periods.map(p => `<td class="text-center text-purple-300">${(per[p] || 0).toFixed(2)}</td>`).join('');
+        return `<tr>
+            <td class="font-mono text-purple-400">${escapeHtml(g.group)}</td>
+            ${cells}
+            <td class="text-center font-semibold text-purple-300">${(g.fte_avg || 0).toFixed(2)}</td>
+        </tr>`;
+    }).join('');
+
     const totalVals = periods.map(p => fteTotals[p] || 0);
     const totalAvg = totalVals.length ? totalVals.reduce((a, b) => a + b, 0) / totalVals.length : 0;
     const totalRow = `<tr style="border-top:1px solid #334155;">
@@ -6952,7 +7024,7 @@ function renderFteTable() {
         <td class="text-center font-bold text-slate-100">${totalAvg.toFixed(2)}</td>
     </tr>`;
 
-    body.innerHTML = (groupRows || '') + totalRow;
+    body.innerHTML = groupRows + extraRows + totalRow;
 }
 
 function escapeHtml(s) {
@@ -6962,6 +7034,10 @@ function escapeHtml(s) {
 }
 
 async function saveMachineEdit(td) {
+    if (_machineOpInFlight) {
+        td.textContent = td.dataset.currentDisplay || td.dataset._orig || '';
+        return;
+    }
     const mc = td.dataset.mc;
     const field = td.dataset.field;
     const raw = (td.textContent || '').trim().replace('%', '').replace(',', '.');
@@ -6983,6 +7059,7 @@ async function saveMachineEdit(td) {
     }
 
     td.classList.add('opacity-50');
+    _machineOpInFlight = true;
     const beforeImpact = _snapshotMachineImpactState();
     const fieldUnit = field === 'shift_hours' ? 'h' : '%';
     const fieldLabel = field === 'oee' ? 'OEE' : field === 'shift_hours' ? 'Shift-uren' : 'Availability';
@@ -7010,17 +7087,21 @@ async function saveMachineEdit(td) {
         _machinesRedoDepth = out.redo_depth || 0;
         _updateMachineButtons();
         _buildMachineDeltaSummary(beforeImpact, out, [directChange]);
-        await _applyServerPayload(out, { deltaSource: 'plan', skipDeltaRecording: true });
+        await _applyServerPayload(out, { deltaSource: 'plan', skipDeltaRecording: true, skipDashboard: true });
+        await loadMachinesData();
     } catch (err) {
         log('Machine update failed: ' + err);
         td.textContent = td.dataset.currentDisplay || '';
     } finally {
+        _machineOpInFlight = false;
         td.classList.remove('opacity-50');
     }
 }
 
 async function undoMachineEdit() {
+    if (_machineOpInFlight) return;
     if (_machinesUndoDepth === 0) return;
+    _machineOpInFlight = true;
     try {
         const beforeImpact = _snapshotMachineImpactState();
         const res = await fetch('/api/machines/undo', { method: 'POST' });
@@ -7040,12 +7121,16 @@ async function undoMachineEdit() {
                 : 'hersteld',
         };
         _buildMachineDeltaSummary(beforeImpact, out, [directChange]);
-        await _applyServerPayload(out, { deltaSource: 'plan', skipDeltaRecording: true });
+        await _applyServerPayload(out, { deltaSource: 'plan', skipDeltaRecording: true, skipDashboard: true });
+        await loadMachinesData();
     } catch (err) { log('Undo failed: ' + err); }
+    finally { _machineOpInFlight = false; }
 }
 
 async function redoMachineEdit() {
+    if (_machineOpInFlight) return;
     if (_machinesRedoDepth === 0) return;
+    _machineOpInFlight = true;
     try {
         const beforeImpact = _snapshotMachineImpactState();
         const res = await fetch('/api/machines/redo', { method: 'POST' });
@@ -7066,12 +7151,32 @@ async function redoMachineEdit() {
                 : 'hersteld',
         };
         _buildMachineDeltaSummary(beforeImpact, out, [directChange]);
-        await _applyServerPayload(out, { deltaSource: 'plan', skipDeltaRecording: true });
+        await _applyServerPayload(out, { deltaSource: 'plan', skipDeltaRecording: true, skipDashboard: true });
+        await loadMachinesData();
     } catch (err) { log('Redo failed: ' + err); }
+    finally { _machineOpInFlight = false; }
 }
 
 async function resetMachineEdits() {
-    if (!confirm('Alle OEE/availability wijzigingen terugzetten naar de laatste Calculate-waarden?')) return;
+    if (_machineResetInFlight) return;
+    _machineResetInFlight = true;
+    const active = document.querySelector('#oeeTableBody td.mach-edit[contenteditable="true"]');
+    if (active) {
+        active.textContent = active.dataset.currentDisplay || active.dataset._orig || '';
+        active.removeAttribute('contenteditable');
+        active.blur();
+    }
+    const idle = await _waitForMachineOpIdle();
+    if (!idle) {
+        log('Machine reset skipped: another machine update is still running.');
+        _machineResetInFlight = false;
+        return;
+    }
+    if (!confirm('Alle OEE, availability en shift-uren terugzetten naar de laatste Calculate-waarden?')) {
+        _machineResetInFlight = false;
+        return;
+    }
+    _machineOpInFlight = true;
     try {
         const beforeImpact = _snapshotMachineImpactState();
         const res = await fetch('/api/machines/reset', { method: 'POST' });
@@ -7087,8 +7192,13 @@ async function resetMachineEdits() {
             old_display: 'huidige waarden',
             new_display: 'laatste Calculate',
         }]);
-        await _applyServerPayload(out, { deltaSource: 'plan', skipDeltaRecording: true });
+        await _applyServerPayload(out, { deltaSource: 'plan', skipDeltaRecording: true, skipDashboard: true });
+        await loadMachinesData();
     } catch (err) { log('Machine reset failed: ' + err); }
+    finally {
+        _machineOpInFlight = false;
+        _machineResetInFlight = false;
+    }
 }
 async function loadInventoryData() {
     try {
@@ -7533,8 +7643,7 @@ async function _doUpload(file) {
         state.valueAuxEdits = {};
         state.valueRowDeltas = {};
         state.demandTurnoverDeltas = {};
-        state.machineDeltaSummary = null;
-        renderMachineDeltaSummary();
+        _setMachineDeltaSummary(null);
         log('Raw data loaded: ' + data.filename + (data.planning_month ? ' | Planning month: ' + data.planning_month : ''));
         _markAutoSaved();
         status('Click Calculate');
@@ -7803,8 +7912,7 @@ async function uploadMultiFiles() {
         state.valueAuxEdits = {};
         state.valueRowDeltas = {};
         state.demandTurnoverDeltas = {};
-        state.machineDeltaSummary = null;
-        renderMachineDeltaSummary();
+        _setMachineDeltaSummary(null);
         log('Extract files loaded: ' + data.filename + (data.planning_month ? ' | Planning month: ' + data.planning_month : ''));
         _markAutoSaved();
         status('Click Calculate');
@@ -7836,7 +7944,13 @@ async function loadSessions() {
     try {
         const res = await fetch('/api/sessions');
         const data = await res.json();
-        if (data.active_session_id) state.activeSessionId = data.active_session_id;
+        if (data.active_session_id) {
+            if (data.active_session_id !== state.activeSessionId) {
+                _rememberMachineDeltaSummaryForSession();
+                state.activeSessionId = data.active_session_id;
+                _restoreMachineDeltaSummaryForSession(data.active_session_id);
+            }
+        }
         else {
             state.activeSessionId = null;
             clearActiveSessionUi();
@@ -7869,7 +7983,7 @@ function clearActiveSessionUi() {
     state.valueAuxEdits = {};
     state.valueRowDeltas = {};
     state.demandTurnoverDeltas = {};
-    state.machineDeltaSummary = null;
+    _setMachineDeltaSummary(null);
     previousValues = {};
     previousValuePlanningValues = {};
     _clearTransientTableState();
@@ -7936,8 +8050,11 @@ function renderSessionList(groups, activeId) {
         html += `<div class="session-group-header">${groupLabel}</div>`;
         for (const sess of groups[key]) {
             const isActive = sess.id === activeId;
-            const badgeCls = sess.calculated ? 'calculated' : 'pending';
-            const badgeTxt = sess.calculated ? 'Ready' : (sess.is_snapshot ? 'Saved scenario' : 'Pending');
+            const restoreStatus = sess.restore_status || (sess.calculated ? 'ready' : 'pending');
+            const badgeCls = (restoreStatus === 'ready' || sess.calculated) ? 'calculated' : 'pending';
+            const badgeTxt = restoreStatus === 'warming' ? 'Warming'
+                : (restoreStatus === 'failed' ? 'Failed'
+                : (sess.calculated ? 'Ready' : (sess.is_snapshot ? 'Saved scenario' : 'Pending')));
             const nameColor = isActive ? '#93c5fd' : '#e2e8f0';
             const mats = (sess.metadata && sess.metadata.materials) || 0;
             const displayName = sess.custom_name || sess.filename;
@@ -7992,9 +8109,9 @@ async function switchSession(sessionId) {
         if (params.months_actuals !== undefined) document.getElementById('monthsActuals').value = params.months_actuals;
         if (params.months_forecast !== undefined) document.getElementById('monthsForecast').value = params.months_forecast;
         updateHorizonDisplay();
+        _rememberMachineDeltaSummaryForSession();
         state.activeSessionId = data.active_session_id;
-        state.machineDeltaSummary = null;
-        renderMachineDeltaSummary();
+        _restoreMachineDeltaSummaryForSession(data.active_session_id);
         // Sync valuation param inputs to the switched-to session's values.
         if (data.valuation_params) {
             for (let i = 1; i <= 8; i++) {
@@ -8006,6 +8123,17 @@ async function switchSession(sessionId) {
         _loadPendingEditsIntoState(data.pending_edits || {});
         _loadValueAuxOverridesIntoState(data.value_aux_overrides || {});
         updateEditBadge();
+        if (data.restore_status === 'warming' && !data.calculated) {
+            state.results = null; state.valueResults = null; state.consolidation = [];
+            document.getElementById('exportBtn').disabled = true;
+            document.getElementById('exportDbBtn').disabled = true;
+            status('Sessie wordt voorbereid...');
+            setTimeout(() => {
+                if (state.activeSessionId === sessionId && !_isSwitchingSession) switchSession(sessionId);
+            }, 1500);
+            await loadSessions();
+            return;
+        }
         if (data.calculated) {
             await loadResults();
             await loadValueResults();

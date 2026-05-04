@@ -6,6 +6,7 @@ import sys
 import io
 import os
 import contextlib
+import threading
 
 from ui.parsers import (
     format_purchased_and_produced as _format_purchased_and_produced,
@@ -25,9 +26,12 @@ from ui.config_store import (
     save_global_config,
     sync_global_config_from_engine,
 )
+from ui.cascade import (
+    finish_pap_recalc as _finish_pap_recalc_impl,
+    recalc_pap_material as _recalc_pap_material_impl,
+)
 from ui.errors import classify_upload_exception as _classify_upload_exception
 from ui.replay import (
-    get_value_aux_override_values,
     recalculate_value_results,
     replay_pending_edits,
 )
@@ -63,6 +67,14 @@ from ui.state_snapshot import (
     restore_engine_state,
     row_key_from_obj as _row_key_from_obj,
     snapshot_has_manual_edits as _snapshot_has_manual_edits,
+)
+from ui.volume_change import (
+    EDITABLE_LINE_TYPES,
+    VALUE_AUX_EDITABLE_LINE_TYPES,
+    SHIFT_HOURS_LOOKUP_FALLBACK,
+    apply_volume_change,
+    recalculate_capacity_and_values,
+    recalc_one_material,
 )
 
 RESOURCE_ROOT = resource_root()
@@ -113,24 +125,6 @@ scenarios: dict = {}          # scenario_id -> scenario snapshot
 _CYCLE_STORAGE_DIR = APP_EXPORTS_DIR
 _cycle_manager = CycleManager(str(_CYCLE_STORAGE_DIR))
 
-# Line types that users are permitted to edit directly.
-# Computed lines (03, 04, 07-12) are intentionally excluded.
-EDITABLE_LINE_TYPES = {
-    '01. Demand forecast',
-    '05. Minimum target stock',
-    '06. Production plan',
-    '06. Purchase receipt',
-}
-
-# Value-planning rows whose Aux Column acts as the editable financial factor.
-VALUE_AUX_EDITABLE_LINE_TYPES = {
-    '01. Demand forecast',
-    '03. Total demand',
-    '04. Inventory',
-    '06. Purchase receipt',
-    '07. Capacity utilization',
-    '12. FTE requirements',
-}
 
 SESSIONS_STORE = APP_DATA_ROOT / 'sessions_store.json'
 GLOBAL_CONFIG_FILE = APP_DATA_ROOT / 'global_config.json'
@@ -138,6 +132,8 @@ GLOBAL_CONFIG_FILE = APP_DATA_ROOT / 'global_config.json'
 _global_config: dict = {}
 _VERBOSE_STARTUP = os.getenv('SOP_VERBOSE_STARTUP', '').strip().lower() in ('1', 'true', 'yes', 'on')
 _DISABLE_AUTORUN = os.getenv('SOP_DISABLE_AUTORUN', '').strip().lower() in ('1', 'true', 'yes', 'on')
+_session_warmup_lock = threading.Lock()
+_session_warmup_events: dict[str, threading.Event] = {}
 
 
 def _restore_engine_state(engine, snapshot: dict) -> None:
@@ -183,6 +179,66 @@ def _load_sessions_from_disk():
     sessions, active_session_id = load_sessions_from_disk(SESSIONS_STORE)
 
 
+def _build_and_install_session_engine(sess: dict):
+    engine = build_clean_engine_for_session(sess, _global_config)
+    if engine is None:
+        return None
+    _install_clean_engine_baseline(sess, engine, clear_machine_overrides=False)
+    with app.app_context():
+        _replay_pending_edits(sess, engine)
+    return engine
+
+
+def _start_session_warmup(session_id: str) -> bool:
+    with _session_warmup_lock:
+        existing = _session_warmup_events.get(session_id)
+        if existing is not None and not existing.is_set():
+            return True
+        event = threading.Event()
+        _session_warmup_events[session_id] = event
+
+    def _worker():
+        sess = sessions.get(session_id)
+        if sess is None:
+            event.set()
+            return
+        label = sess.get('custom_name') or sess.get('filename', session_id)
+        sess['restore_status'] = 'warming'
+        sess['restore_error'] = None
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                engine = _build_and_install_session_engine(sess)
+            if engine is None:
+                sess['restore_status'] = 'cold'
+            elif sessions.get(session_id) is sess:
+                sess['engine'] = engine
+                sess['restore_status'] = 'ready'
+                sess['restore_error'] = None
+        except Exception as exc:
+            sess['restore_status'] = 'failed'
+            sess['restore_error'] = str(exc)
+            import logging
+            logging.getLogger(__name__).error(f'session warmup FAIL "{label}": {exc}')
+        finally:
+            event.set()
+            _save_sessions_to_disk()
+
+    threading.Thread(
+        target=_worker,
+        name=f'session-warmup-{session_id[:8]}',
+        daemon=True,
+    ).start()
+    return True
+
+
+def _wait_for_session_warmup(session_id: str, timeout_seconds: float) -> bool:
+    with _session_warmup_lock:
+        event = _session_warmup_events.get(session_id)
+    if event is None:
+        return False
+    return event.wait(timeout_seconds)
+
+
 def _apply_folder_config():
     """Apply folder paths from _global_config, update globals and CycleManager."""
     global APP_UPLOADS_DIR, APP_EXPORTS_DIR, SESSIONS_STORE, _cycle_manager
@@ -216,7 +272,7 @@ app.register_blueprint(create_config_blueprint(
     lambda sess, engine: ensure_reset_baseline(sess, engine, SHIFT_HOURS_LOOKUP_FALLBACK),
     lambda engine, material_number: _recalc_pap_material(engine, material_number),
     lambda engine: _finish_pap_recalc(engine),
-    lambda engine, sess=None: _recalculate_value_results(engine, sess),
+    lambda engine, sess=None: recalculate_value_results(engine, sess),
     lambda sess, params=None: build_clean_engine_for_session(sess, _global_config, params),
     _install_clean_engine_baseline,
     lambda sess, engine: _replay_pending_edits(sess, engine),
@@ -233,7 +289,7 @@ app.register_blueprint(create_machines_blueprint(
     _machine_overrides_from_engine,
     lambda machine, data: SHIFT_HOURS_LOOKUP_FALLBACK(machine, data),
     lambda sess, engine: ensure_reset_baseline(sess, engine, SHIFT_HOURS_LOOKUP_FALLBACK),
-    lambda engine, sess: _recalculate_capacity_and_values(engine, sess),
+    lambda engine, sess: recalculate_capacity_and_values(engine, sess),
     _planning_value_payload,
     _save_sessions_to_disk,
 ))
@@ -262,6 +318,8 @@ app.register_blueprint(create_sessions_blueprint(
     _snapshot_has_manual_edits,
     _engine_has_manual_edits,
     lambda: app.app_context(),
+    _start_session_warmup,
+    _wait_for_session_warmup,
 ))
 app.register_blueprint(create_scenarios_blueprint(
     scenarios,
@@ -282,7 +340,6 @@ app.register_blueprint(create_exports_blueprint(
     lambda: _get_active(),
     lambda: APP_EXPORTS_DIR,
     lambda: _cycle_manager,
-    lambda path, engine: _apply_edit_highlights(path, engine),
 ))
 app.register_blueprint(create_edit_state_blueprint(
     sessions,
@@ -293,9 +350,9 @@ app.register_blueprint(create_edits_blueprint(
     lambda: _get_active(),
     VALUE_AUX_EDITABLE_LINE_TYPES,
     _global_config,
-    lambda *args, **kwargs: _apply_volume_change(*args, **kwargs),
+    lambda *args, **kwargs: apply_volume_change(*args, **kwargs),
     lambda sess, engine: ensure_reset_baseline(sess, engine, SHIFT_HOURS_LOOKUP_FALLBACK),
-    lambda engine, sess: _recalculate_value_results(engine, sess),
+    lambda engine, sess: recalculate_value_results(engine, sess),
     _save_sessions_to_disk,
     _valuation_params_from_config,
     _restore_engine_state,
@@ -323,18 +380,11 @@ def _replay_pending_edits(sess, engine):
     replay_pending_edits(
         sess,
         engine,
-        _apply_volume_change,
+        apply_volume_change,
         _apply_machine_overrides,
-        _recalculate_capacity_and_values,
+        recalculate_capacity_and_values,
     )
 
-
-def _get_value_aux_override_values(sess) -> dict:
-    return get_value_aux_override_values(sess)
-
-
-def _recalculate_value_results(engine, sess=None):
-    recalculate_value_results(engine, sess)
 
 
 def _autorun_sessions():
@@ -406,636 +456,15 @@ def _set_active_session_id(session_id):
     active_session_id = session_id
 
 
-def SHIFT_HOURS_LOOKUP_FALLBACK(machine, data):
-    """Resolve shift hours for a machine, tolerating minor API drift."""
-    if machine is None:
-        return 520.0
-    sho = getattr(machine, 'shift_hours_override', None)
-    if sho is not None:
-        return float(sho)
-    from modules.models import SHIFT_HOURS, ShiftSystem
-    try:
-        key = machine.shift_system.value if hasattr(machine.shift_system, 'value') else machine.shift_system
-        # shift_hours dict in data_loader uses human-readable keys ('3-shift system' etc.)
-        if isinstance(key, str) and key in data.shift_hours:
-            return data.shift_hours[key]
-    except Exception:
-        pass
-    return SHIFT_HOURS.get(machine.shift_system, 520.0)
-
-
-
-def _apply_edit_highlights(path: str, engine):
-    """Open the exported workbook and apply edit highlights + summary sheet."""
-    import openpyxl
-    from openpyxl.styles import PatternFill, Font
-    from openpyxl.comments import Comment
-
-    # Collect all edit
-    all_edits = []
-    for _, rows in engine.results.items():
-        for row in rows:
-            if row.manual_edits:
-                for period, edit_data in row.manual_edits.items():
-                    original = edit_data.get('original', 0.0)
-                    new_val = edit_data.get('new', 0.0)
-                    delta_pct = round((new_val - original) / abs(original) * 100, 2) if original != 0 else 0.0
-                    all_edits.append({
-                        'line_type': row.line_type,
-                        'material_number': row.material_number,
-                        'material_name': row.material_name,
-                        'period': period,
-                        'original': original,
-                        'new': new_val,
-                        'delta_pct': delta_pct,
-                    })
-
-    if not all_edits:
-        return
-
-    wb = openpyxl.load_workbook(path)
-    ws = wb['Planning sheet']
-
-    # Build column lookups from header row
-    header = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
-    period_col = {}
-    mat_col_idx = None
-    lt_col_idx = None
-    for i, val in enumerate(header, start=1):
-        if val is None:
-            continue
-        s = str(val)
-        period_col[s] = i
-        if s == 'Material number':
-            mat_col_idx = i
-        elif s == 'Line type':
-            lt_col_idx = i
-
-    # Build row lookup: (material_number, line_type) -> row_idx
-    row_lookup = {}
-    if mat_col_idx and lt_col_idx:
-        for row_idx, row_data in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-            mat_val = row_data[mat_col_idx - 1]
-            lt_val = row_data[lt_col_idx - 1]
-            if mat_val and lt_val:
-                row_lookup[(str(mat_val), str(lt_val))] = row_idx
-
-    # Fill styles
-    yellow_fill = PatternFill(start_color='FFEB3B', end_color='FFEB3B', fill_type='solid')
-    green_fill = PatternFill(start_color='C8E6C9', end_color='C8E6C9', fill_type='solid')
-    red_fill = PatternFill(start_color='FFCDD2', end_color='FFCDD2', fill_type='solid')
-    bold_font = Font(bold=True)
-
-    for edit in all_edits:
-        row_idx = row_lookup.get((edit['material_number'], edit['line_type']))
-        col_idx = period_col.get(edit['period'])
-        if row_idx is None or col_idx is None:
-            continue
-        cell = ws.cell(row=row_idx, column=col_idx)
-        original = edit['original']
-        new_val = edit['new']
-        delta_pct = edit['delta_pct']
-        if new_val > original:
-            cell.fill = green_fill
-            cell.font = bold_font
-        elif new_val < original:
-            cell.fill = red_fill
-            cell.font = bold_font
-        else:
-            cell.fill = yellow_fill
-        cell.comment = Comment(f"Original: {original}\nNew: {new_val}\nDelta: {delta_pct}%", 'SOP Engine')
-
-    # Edits Summary sheet
-    if 'Edits Summary' in wb.sheetnames:
-        del wb['Edits Summary']
-    ws_edits = wb.create_sheet('Edits Summary')
-    ws_edits.append(['Line Type', 'Material Number', 'Material Name', 'Period',
-                     'Original Value', 'New Value', 'Delta %'])
-    for edit in all_edits:
-        ws_edits.append([edit['line_type'], edit['material_number'], edit['material_name'],
-                         edit['period'], edit['original'], edit['new'], edit['delta_pct']])
-
-    wb.save(path)
-
-
-def _apply_volume_change(sess, current_engine, line_type, material_number, period, new_value,
-                          aux_column='',
-                          push_undo=True):
-    """Internal helper: apply a volume change + cascade and return jsonify result.
-
-    Used by /api/update_volume (via direct code), /api/undo, /api/redo.
-    """
-    if line_type not in EDITABLE_LINE_TYPES:
-        return jsonify({'error': f'Line type "{line_type}" is not editable'}), 403
-    rows = current_engine.results.get(line_type, [])
-    material_number = str(material_number)
-    aux_column = str(aux_column or '').strip()
-    material_rows = [r for r in rows if str(getattr(r, 'material_number', '')) == material_number]
-    target_row = next(
-        (r for r in material_rows
-         if str(getattr(r, 'aux_column', '') or '').strip() == aux_column),
-        None
-    )
-    if target_row is None and len(material_rows) == 1:
-        # Backward-compatible fallback for older clients and harmless formatting drift.
-        target_row = material_rows[0]
-    if target_row is None:
-        available_aux = sorted({str(getattr(r, 'aux_column', '') or '').strip() for r in material_rows})
-        detail = f'Row not found for {line_type} / {material_number}'
-        if aux_column:
-            detail += f' / aux "{aux_column}"'
-        if available_aux:
-            detail += f'. Available aux: {", ".join(available_aux[:6])}'
-        return jsonify({'error': detail}), 404
-    ensure_reset_baseline(sess, current_engine, SHIFT_HOURS_LOOKUP_FALLBACK)
-
-    # Enforce ceiling rounding for L06 line types so the stored value always
-    # respects the configured lot multiple (BOM header qty for production plan,
-    # MOQ for purchase receipt). Only applies when new_value > 0; setting to 0
-    # is allowed unconditionally (manual clearance).
-    if new_value > 0 and line_type in (LineType.PRODUCTION_PLAN.value, LineType.PURCHASE_RECEIPT.value):
-        from modules.inventory_engine import ceiling_multiple as _ceil_mult
-        if line_type == LineType.PRODUCTION_PLAN.value:
-            _multiple = current_engine.data.get_production_ceiling(material_number)
-        else:
-            _multiple = current_engine.data.get_purchase_moq(material_number)
-        if _multiple and _multiple > 0:
-            new_value = _ceil_mult(new_value, _multiple)
-
-    old_value = target_row.get_value(period)
-
-    if push_undo:
-        undo_stack = sess.setdefault('undo_stack', [])
-        sess.setdefault('redo_stack', []).clear()
-        undo_stack.append({'line_type': line_type, 'material_number': material_number,
-                           'aux_column': str(getattr(target_row, 'aux_column', '') or ''),
-                           'period': period, 'old_value': old_value, 'new_value': new_value})
-        if len(undo_stack) > 50:
-            undo_stack.pop(0)
-
-    # Update manual_edits tracking
-    if period not in target_row.manual_edits:
-        target_row.manual_edits[period] = {'original': old_value, 'new': new_value}
-    else:
-        target_row.manual_edits[period]['new'] = new_value
-    # If restored to original, remove the edit tracking entry
-    original_val = target_row.manual_edits[period].get('original', old_value)
-    if new_value == original_val:
-        target_row.manual_edits.pop(period, None)
-
-    target_row.set_value(period, new_value)
-
-    # Keep pending_edits in sync server-side so the edit survives a server restart
-    # without needing the frontend's separate /api/sessions/edits/persist call.
-    _edit_key = f"{line_type}||{material_number}||{aux_column}||{period}"
-    _pending = sess.setdefault('pending_edits', {})
-    if new_value == original_val:
-        _pending.pop(_edit_key, None)
-    else:
-        # Preserve the original baseline from any existing entry so repeated edits
-        # of the same cell don't overwrite the true pre-edit value.
-        _baseline = _pending.get(_edit_key, {}).get('original', original_val)
-        _pending[_edit_key] = {'original': _baseline, 'new_value': new_value}
-
-    if line_type == LineType.MIN_TARGET_STOCK.value:
-        target_stock_values = dict(target_row.values)
-        _recalc_material_subtree(
-            current_engine,
-            material_number,
-            override_root_forecast=False,
-            root_override_target_stock_values=target_stock_values,
-            preserve_root_l05=True,
-        )
-        _recalculate_capacity_and_values(current_engine, sess)
-
-    elif line_type == LineType.DEMAND_FORECAST.value:
-        _recalc_material_subtree(
-            current_engine,
-            material_number,
-            override_root_forecast=True,
-            root_override_target_stock=None,
-            preserve_root_l05=True,
-        )
-        _recalculate_capacity_and_values(current_engine, sess)
-
-    elif line_type in (LineType.PRODUCTION_PLAN.value, LineType.PURCHASE_RECEIPT.value):
-        from modules.bom_engine import BOMEngine
-        from modules.inventory_engine import InventoryEngine
-
-        periods_list = current_engine.data.periods
-
-        # Gather current rows (target_row already has new_value applied)
-        prod_row  = next((r for r in current_engine.results.get(LineType.PRODUCTION_PLAN.value, [])
-                          if r.material_number == material_number), None)
-        purch_row = next((r for r in current_engine.results.get(LineType.PURCHASE_RECEIPT.value, [])
-                          if r.material_number == material_number), None)
-        l05_row   = next((r for r in current_engine.results.get(LineType.MIN_TARGET_STOCK.value, [])
-                          if r.material_number == material_number), None)
-
-        # Recalculate this material's own inventory and L06/L07 using fixed manual overrides for edited periods.
-        # This avoids silently overwriting the user's manual edit while still refreshing later periods.
-        inv_eng = InventoryEngine(current_engine.data)
-        fc_row = next(
-            (r for r in current_engine.results.get(LineType.DEMAND_FORECAST.value, [])
-             if r.material_number == material_number), None
-        )
-        forecast_vals = dict(fc_row.values) if fc_row else {p: 0.0 for p in periods_list}
-
-        mat_l02 = [r for r in current_engine.results.get(LineType.DEPENDENT_DEMAND.value, [])
-                   if r.material_number == material_number]
-        dep_demand_agg = {p: 0.0 for p in periods_list}
-        dep_demand_by_parent = {}
-        for r in mat_l02:
-            parent = r.aux_column
-            if parent:
-                dep_demand_by_parent[parent] = dict(r.values)
-                for p in periods_list:
-                    dep_demand_agg[p] = dep_demand_agg.get(p, 0.0) + r.values.get(p, 0.0)
-
-        inv_result = inv_eng.calculate_for_material(
-            material_number,
-            forecast_vals,
-            dep_demand_agg,
-            dep_demand_by_parent,
-            override_target_stock_values=dict(l05_row.values) if l05_row else None,
-            fixed_production_plan=_fixed_manual_values(prod_row),
-            fixed_purchase_receipt=_fixed_manual_values(purch_row),
-        )
-
-        inv_line_types = [
-            LineType.TOTAL_DEMAND.value, LineType.INVENTORY.value,
-            LineType.MIN_TARGET_STOCK.value, LineType.PRODUCTION_PLAN.value,
-            LineType.PURCHASE_RECEIPT.value, LineType.PURCHASE_PLAN.value,
-        ]
-        # Preserve manual_edits markers for L06/L07 across the rebuild â€” otherwise
-        # a subsequent edit would forget prior edited months and recompute them heuristically.
-        prior_prod_edits = dict(prod_row.manual_edits) if prod_row and getattr(prod_row, 'manual_edits', None) else {}
-        prior_purch_edits = dict(purch_row.manual_edits) if purch_row and getattr(purch_row, 'manual_edits', None) else {}
-        for lt in inv_line_types:
-            current_engine.results[lt] = [
-                r for r in current_engine.results.get(lt, []) if r.material_number != material_number
-            ]
-
-        for row in inv_result['rows']:
-            if row.line_type == LineType.MIN_TARGET_STOCK.value and l05_row:
-                row.values = dict(l05_row.values)
-                row.manual_edits = dict(l05_row.manual_edits)
-            elif row.line_type == LineType.PRODUCTION_PLAN.value and prior_prod_edits:
-                row.manual_edits = prior_prod_edits
-            elif row.line_type == LineType.PURCHASE_RECEIPT.value and prior_purch_edits:
-                row.manual_edits = prior_purch_edits
-            if row.line_type in current_engine.results:
-                current_engine.results[row.line_type].append(row)
-
-        if inv_result['production_plan'] is not None:
-            current_engine.all_production_plans[material_number] = inv_result['production_plan']
-        else:
-            current_engine.all_production_plans.pop(material_number, None)
-        if inv_result['purchase_receipt'] is not None:
-            current_engine.all_purchase_receipts[material_number] = inv_result['purchase_receipt']
-        else:
-            current_engine.all_purchase_receipts.pop(material_number, None)
-
-        # Rebuild L08 dependent requirements from the (now updated) production plan
-        bom_eng = BOMEngine(current_engine.data)
-        current_engine.results[LineType.DEPENDENT_REQUIREMENTS.value] = [
-            r for r in current_engine.results.get(LineType.DEPENDENT_REQUIREMENTS.value, [])
-            if r.material_number != material_number
-        ]
-        children_demand = {}
-        prod_row = next((r for r in current_engine.results.get(LineType.PRODUCTION_PLAN.value, [])
-                          if r.material_number == material_number), None)
-        if prod_row is not None:
-            children_demand = bom_eng.compute_dependent_requirements(
-                material_number, dict(prod_row.values)
-            )
-            if children_demand:
-                dr_rows = bom_eng.create_dependent_requirements_rows(material_number, children_demand)
-                current_engine.results[LineType.DEPENDENT_REQUIREMENTS.value].extend(dr_rows)
-
-        # Propagate to child materials: refresh direct L02 links from edited parent
-        for child_mat, child_period_demand in children_demand.items():
-            current_engine.results[LineType.DEPENDENT_DEMAND.value] = [
-                r for r in current_engine.results.get(LineType.DEPENDENT_DEMAND.value, [])
-                if not (r.material_number == child_mat and r.aux_column == material_number)
-            ]
-            child_l02_new = bom_eng.create_dependent_demand_rows(
-                child_mat, {material_number: child_period_demand}
-            )
-            current_engine.results[LineType.DEPENDENT_DEMAND.value].extend(child_l02_new)
-
-        # Full downstream cascade: recalculate every affected child (and deeper levels)
-        inv_eng = InventoryEngine(current_engine.data)
-        queue = list(children_demand.keys())
-        visited = {material_number}
-        while queue:
-            child_mat = queue.pop(0)
-            if child_mat in visited:
-                continue
-            visited.add(child_mat)
-            grandchildren = _recalc_one_material(
-                current_engine,
-                child_mat,
-                inv_eng,
-                bom_eng,
-                periods_list,
-                override_forecast=False,
-            )
-            queue.extend(gc for gc in grandchildren if gc not in visited)
-
-        _recalculate_capacity_and_values(current_engine, sess)
-
-    else:
-        _recalculate_value_results(current_engine, sess)
-
-    delta_pct = round((new_value - original_val) / abs(original_val) * 100, 2) if original_val != 0 else 0.0
-    results_dict = {lt: [r.to_dict() for r in rs] for lt, rs in current_engine.results.items()}
-    value_results_dict = {lt: [r.to_dict() for r in rs] for lt, rs in current_engine.value_results.items()}
-    consolidation = [r.to_dict() for r in current_engine.value_results.get(LineType.CONSOLIDATION.value, [])]
-    return jsonify({
-        'success': True,
-        'results': results_dict,
-        'value_results': value_results_dict,
-        'consolidation': consolidation,
-        'edit_meta': {
-            'old_value': old_value,
-            'new_value': new_value,
-            'original_value': original_val,
-            'delta_pct': delta_pct,
-        },
-    })
-
 
 # ---- Prod/Purch Split endpoints ----
 
-def _fixed_manual_values(row):
-    if not row or not getattr(row, 'manual_edits', None):
-        return {}
-    return {
-        period: float(edit.get('new', row.values.get(period, 0.0) or 0.0))
-        for period, edit in row.manual_edits.items()
-    }
-
-
-def _recalc_one_material(
-    current_engine,
-    mat,
-    inv_eng,
-    bom_eng,
-    periods_list,
-    override_forecast=False,
-    override_target_stock=None,
-    override_target_stock_values=None,
-    preserve_l05=True,
-):
-    """Recalculate inventory + BOM for one material. Updates results in-place.
-    Returns {child_mat: child_period_demand} so the caller can cascade further."""
-    fc_row = next(
-        (r for r in current_engine.results.get(LineType.DEMAND_FORECAST.value, [])
-         if r.material_number == mat), None
-    )
-    forecast_vals = dict(fc_row.values) if fc_row else {p: 0.0 for p in periods_list}
-
-    mat_l02 = [r for r in current_engine.results.get(LineType.DEPENDENT_DEMAND.value, [])
-               if r.material_number == mat]
-    dep_demand_agg = {p: 0.0 for p in periods_list}
-    dep_demand_by_parent = {}
-    for r in mat_l02:
-        parent = r.aux_column
-        if parent:
-            dep_demand_by_parent[parent] = dict(r.values)
-            for p in periods_list:
-                dep_demand_agg[p] = dep_demand_agg.get(p, 0.0) + r.values.get(p, 0.0)
-
-    l05_row = next(
-        (r for r in current_engine.results.get(LineType.MIN_TARGET_STOCK.value, [])
-         if r.material_number == mat), None
-    )
-    l05_saved_values = dict(l05_row.values) if l05_row else {}
-    l05_saved_edits = dict(l05_row.manual_edits) if l05_row else {}
-
-    # Preserve manually edited periods for production plan and purchase receipt so
-    # cascade recalculations (demand change, BOM cascade) honour sticky overrides â€”
-    # identical to the direct-edit path in _apply_volume_change.
-    prod_row_pre = next(
-        (r for r in current_engine.results.get(LineType.PRODUCTION_PLAN.value, [])
-         if r.material_number == mat), None
-    )
-    purch_row_pre = next(
-        (r for r in current_engine.results.get(LineType.PURCHASE_RECEIPT.value, [])
-         if r.material_number == mat), None
-    )
-    prior_prod_edits  = dict(prod_row_pre.manual_edits)  if prod_row_pre  and getattr(prod_row_pre,  'manual_edits', None) else {}
-    prior_purch_edits = dict(purch_row_pre.manual_edits) if purch_row_pre and getattr(purch_row_pre, 'manual_edits', None) else {}
-    fixed_prod  = _fixed_manual_values(prod_row_pre)  or None
-    fixed_purch = _fixed_manual_values(purch_row_pre) or None
-
-    kwargs = {}
-    if override_forecast:
-        kwargs['override_forecast'] = forecast_vals
-    if override_target_stock_values is not None:
-        kwargs['override_target_stock_values'] = override_target_stock_values
-    if override_target_stock is not None:
-        kwargs['override_target_stock'] = override_target_stock
-    if fixed_prod:
-        kwargs['fixed_production_plan'] = fixed_prod
-    if fixed_purch:
-        kwargs['fixed_purchase_receipt'] = fixed_purch
-    inv_result = inv_eng.calculate_for_material(
-        mat, forecast_vals, dep_demand_agg, dep_demand_by_parent, **kwargs
-    )
-
-    inv_line_types = [
-        LineType.TOTAL_DEMAND.value, LineType.INVENTORY.value,
-        LineType.MIN_TARGET_STOCK.value, LineType.PRODUCTION_PLAN.value,
-        LineType.PURCHASE_RECEIPT.value, LineType.PURCHASE_PLAN.value,
-    ]
-    for lt in inv_line_types:
-        current_engine.results[lt] = [
-            r for r in current_engine.results.get(lt, []) if r.material_number != mat
-        ]
-    for row in inv_result['rows']:
-        if row.line_type in current_engine.results:
-            current_engine.results[row.line_type].append(row)
-
-    if inv_result.get('purch_raw_need'):
-        current_engine.all_purch_raw_needs[mat] = inv_result['purch_raw_need']
-    else:
-        current_engine.all_purch_raw_needs.pop(mat, None)
-
-    new_l05 = next(
-        (r for r in current_engine.results.get(LineType.MIN_TARGET_STOCK.value, [])
-         if r.material_number == mat), None
-    )
-    if new_l05 and preserve_l05:
-        new_l05.values = l05_saved_values
-        new_l05.manual_edits = l05_saved_edits
-
-    # Restore manual_edits markers on the rebuilt L06 rows so the UI can still
-    # tell which periods were manually set (edit indicators, undo stack, etc.).
-    new_prod_row = next(
-        (r for r in current_engine.results.get(LineType.PRODUCTION_PLAN.value, [])
-         if r.material_number == mat), None
-    )
-    if new_prod_row and prior_prod_edits:
-        new_prod_row.manual_edits = prior_prod_edits
-    new_purch_row = next(
-        (r for r in current_engine.results.get(LineType.PURCHASE_RECEIPT.value, [])
-         if r.material_number == mat), None
-    )
-    if new_purch_row and prior_purch_edits:
-        new_purch_row.manual_edits = prior_purch_edits
-
-    if inv_result['production_plan'] is not None:
-        current_engine.all_production_plans[mat] = inv_result['production_plan']
-    else:
-        current_engine.all_production_plans.pop(mat, None)
-    if inv_result['purchase_receipt'] is not None:
-        current_engine.all_purchase_receipts[mat] = inv_result['purchase_receipt']
-    else:
-        current_engine.all_purchase_receipts.pop(mat, None)
-
-    # Compute dependent requirements and push updated L02/L03 to children
-    current_engine.results[LineType.DEPENDENT_REQUIREMENTS.value] = [
-        r for r in current_engine.results.get(LineType.DEPENDENT_REQUIREMENTS.value, [])
-        if r.material_number != mat
-    ]
-    children_demand = {}
-    if inv_result['production_plan'] is not None:
-        children_demand = bom_eng.compute_dependent_requirements(mat, inv_result['production_plan'])
-        if children_demand:
-            dr_rows = bom_eng.create_dependent_requirements_rows(mat, children_demand)
-            current_engine.results[LineType.DEPENDENT_REQUIREMENTS.value].extend(dr_rows)
-
-    for child_mat, child_period_demand in children_demand.items():
-        current_engine.results[LineType.DEPENDENT_DEMAND.value] = [
-            r for r in current_engine.results.get(LineType.DEPENDENT_DEMAND.value, [])
-            if not (r.material_number == child_mat and r.aux_column == mat)
-        ]
-        child_l02_new = bom_eng.create_dependent_demand_rows(
-            child_mat, {mat: child_period_demand}
-        )
-        current_engine.results[LineType.DEPENDENT_DEMAND.value].extend(child_l02_new)
-
-        child_l01_row = next(
-            (r for r in current_engine.results.get(LineType.DEMAND_FORECAST.value, [])
-             if r.material_number == child_mat), None
-        )
-        child_l03_row = next(
-            (r for r in current_engine.results.get(LineType.TOTAL_DEMAND.value, [])
-             if r.material_number == child_mat), None
-        )
-        if child_l03_row:
-            child_all_l02 = [
-                r for r in current_engine.results.get(LineType.DEPENDENT_DEMAND.value, [])
-                if r.material_number == child_mat
-            ]
-            for p in periods_list:
-                fc_val = child_l01_row.values.get(p, 0.0) if child_l01_row else 0.0
-                dep_val = sum(r.values.get(p, 0.0) for r in child_all_l02)
-                child_l03_row.values[p] = fc_val + dep_val
-
-    return children_demand
-
-
-def _recalc_material_subtree(
-    current_engine,
-    root_material,
-    override_root_forecast=False,
-    root_override_target_stock=None,
-    root_override_target_stock_values=None,
-    preserve_root_l05=True,
-):
-    """Recalculate one edited material and recursively all impacted descendants."""
-    from modules.inventory_engine import InventoryEngine
-    from modules.bom_engine import BOMEngine
-
-    inv_eng = InventoryEngine(current_engine.data)
-    bom_eng = BOMEngine(current_engine.data)
-    periods_list = current_engine.data.periods
-
-    root_children = _recalc_one_material(
-        current_engine,
-        root_material,
-        inv_eng,
-        bom_eng,
-        periods_list,
-        override_forecast=override_root_forecast,
-        override_target_stock=root_override_target_stock,
-        override_target_stock_values=root_override_target_stock_values,
-        preserve_l05=preserve_root_l05,
-    )
-
-    queue = list(root_children.keys())
-    visited = {root_material}
-    while queue:
-        child_mat = queue.pop(0)
-        if child_mat in visited:
-            continue
-        visited.add(child_mat)
-        grandchildren = _recalc_one_material(
-            current_engine,
-            child_mat,
-            inv_eng,
-            bom_eng,
-            periods_list,
-            override_forecast=False,
-            preserve_l05=True,
-        )
-        queue.extend(gc for gc in grandchildren if gc not in visited)
-
-
-def _recalculate_capacity_and_values(current_engine, sess):
-    """Run capacity + value planning after volume cascades."""
-    from modules.capacity_engine import CapacityEngine
-
-    _all_line_data = {
-        lt: {r.material_number: r.values for r in rows}
-        for lt, rows in current_engine.results.items() if rows
-    }
-    cap_eng = CapacityEngine(current_engine.data, current_engine.all_production_plans, _all_line_data)
-    cap_results = cap_eng.calculate()
-    for lt, cap_rows in cap_results.items():
-        current_engine.results[lt] = cap_rows
-    _recalculate_value_results(current_engine, sess)
-
-
 def _recalc_pap_material(current_engine, material_number):
-    """Re-run inventory + full BOM cascade for a PAP material change.
-    Uses BFS so every child (and grandchild, etc.) gets its inventory recalculated
-    after its dependent demand is updated â€” not just L02/L03."""
-    from modules.inventory_engine import InventoryEngine
-    from modules.bom_engine import BOMEngine
-
-    inv_eng = InventoryEngine(current_engine.data)
-    bom_eng = BOMEngine(current_engine.data)
-    periods_list = current_engine.data.periods
-
-    # Recalculate the PAP material itself (override_forecast keeps the PAP split intact)
-    children_demand = _recalc_one_material(
-        current_engine, material_number, inv_eng, bom_eng, periods_list,
-        override_forecast=True,
-    )
-
-    # BFS: recalculate every affected child's inventory so the cascade is complete
-    queue = list(children_demand.keys())
-    visited = {material_number}
-    while queue:
-        child_mat = queue.pop(0)
-        if child_mat in visited:
-            continue
-        visited.add(child_mat)
-        grandchildren_demand = _recalc_one_material(
-            current_engine, child_mat, inv_eng, bom_eng, periods_list,
-            override_forecast=False,
-        )
-        queue.extend(gc for gc in grandchildren_demand if gc not in visited)
-
+    _recalc_pap_material_impl(current_engine, material_number, recalc_one_material)
 
 def _finish_pap_recalc(current_engine):
-    """Run capacity + value engines after a PAP fraction change."""
     sess = sessions.get(active_session_id) if active_session_id else None
-    _recalculate_capacity_and_values(current_engine, sess)
+    _finish_pap_recalc_impl(current_engine, sess, recalculate_capacity_and_values)
 
 
 _SESSION_SAVE_PATHS = {

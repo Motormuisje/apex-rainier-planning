@@ -70,6 +70,8 @@ class PlanningEngine:
         self.all_purchase_receipts: Dict[str, Dict[str, float]] = {}
         self.all_total_demands: Dict[str, Dict[str, float]] = {}
         self.all_purch_raw_needs: Dict[str, Dict[str, float]] = {}
+        self.machine_throughput_theo: Dict[str, float] = {}
+        self.output_by_machine_period: Dict[str, Dict[str, float]] = {}
         
         # Value planning (NEW)
         self.value_results: Dict[str, List[PlanningRow]] = {}
@@ -332,6 +334,7 @@ class PlanningEngine:
         capacity_results = capacity_engine.calculate()
         for line_type, rows in capacity_results.items():
             self.results[line_type] = rows
+        self.rebuild_machine_output_caches()
         
         # ===== STEP 6: Value planning calculations =====
         print("\n[STEP 6] Calculating value planning...")
@@ -349,6 +352,49 @@ class PlanningEngine:
         self._print_summary()
 
         return self
+
+    def rebuild_machine_output_caches(self) -> None:
+        """Precompute per-machine throughput data used by the machines route."""
+        if self.data is None:
+            self.machine_throughput_theo = {}
+            self.output_by_machine_period = {}
+            return
+
+        periods = self.data.periods
+
+        theo_lists = {}
+        for mat_num in list(self.data.materials.keys()):
+            try:
+                routings = self.data.get_all_routings(mat_num)
+            except Exception:
+                continue
+            for routing in routings:
+                wc = routing.work_center
+                if routing.base_quantity > 0 and routing.standard_time > 0:
+                    theo_lists.setdefault(wc, []).append(routing.base_quantity / routing.standard_time)
+        self.machine_throughput_theo = {
+            wc: sum(values) / len(values) if values else 0.0
+            for wc, values in theo_lists.items()
+        }
+
+        output_by_machine_period = {
+            mc: {period: 0.0 for period in periods}
+            for mc in self.data.machines
+        }
+        for mat_num, plan_data in self.all_production_plans.items():
+            try:
+                routings = self.data.get_all_routings(mat_num)
+            except Exception:
+                continue
+            for routing in routings:
+                wc = routing.work_center
+                if wc not in output_by_machine_period:
+                    continue
+                for period in periods:
+                    qty = plan_data.get(period, 0.0)
+                    if qty > 0:
+                        output_by_machine_period[wc][period] += qty
+        self.output_by_machine_period = output_by_machine_period
 
     def _compile_all_rows(self):
         self.all_rows = []
@@ -536,8 +582,8 @@ class PlanningEngine:
                 pass  # no freeze panes
 
             # ---- High-level overview sheet (VBA CreateHighLevelOverview line 2804) ----
-            from openpyxl.chart import BarChart, LineChart, Reference
-            from openpyxl.chart.series import SeriesLabel
+            from openpyxl.drawing.image import Image as _XLImage
+            import modules.chart_renderer as _cr
 
             ws_overview = wb.create_sheet('High-level overview')
             ws_overview.sheet_properties.tabColor = '8B4513'  # brown tab matching VBA
@@ -567,7 +613,6 @@ class PlanningEngine:
 
             n_periods = len(self.data.periods)
             n_consol = len(consol_rows)
-            cats = Reference(ws_overview, min_col=3, max_col=2 + n_periods, min_row=1)
 
             # KPI summary table (VBA lines 2868-2940: 13 text box KPIs → formatted cells)
             from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -628,68 +673,39 @@ class PlanningEngine:
             _ov_chart2_anchor = 'A' + str(_chart_base + 24)   # Inventory Quality (Phase 2)
             _ov_chart3_anchor = 'A' + str(_chart_base + 60)   # Top 10 Overstocks (Phase 2)
 
-            # Chart 1 — Projected Financial Metrics (VBA step 141)
-            chart1 = LineChart()
-            chart1.title = 'Projected Financial Metrics'
-            chart1.width = 20
-            chart1.height = 12
-            chart1.y_axis.title = 'Value'
-            metrics_chart1 = ['TURNOVER', 'COST OF GOODS', 'GROSS MARGIN', 'INVENTORY VALUE']
-            for metric in metrics_chart1:
-                for r_idx, row in enumerate(consol_rows, start=2):
-                    if row.material_number.replace('ZZZZZZ_', '') == metric:
-                        data_ref = Reference(ws_overview, min_col=3, max_col=2 + n_periods, min_row=r_idx)
-                        chart1.add_data(data_ref, titles_from_data=False)
-                        chart1.series[-1].title = SeriesLabel(v=metric)
+            # Chart 1 — Projected Financial Metrics (PNG embed)
+            _fm_series = {}
+            for _m in ['TURNOVER', 'COST OF GOODS', 'GROSS MARGIN', 'INVENTORY VALUE']:
+                for _row in consol_rows:
+                    if _row.material_number.replace('ZZZZZZ_', '') == _m:
+                        _fm_series[_m] = [_row.get_value(p) for p in self.data.periods]
                         break
-            chart1.set_categories(cats)
-            ws_overview.add_chart(chart1, 'A' + str(_chart_base))
+            _fm_img = _XLImage(_cr.financial_metrics(self.data.periods, _fm_series))
+            _fm_img.anchor = 'A' + str(_chart_base)
+            ws_overview.add_image(_fm_img)
 
-            # Chart 4 — ROCE Components (VBA step 144; 4th of 5 charts in sequence)
-            chart2 = LineChart()
-            chart2.title = 'ROCE Components'
-            chart2.width = 20
-            chart2.height = 12
-            chart2.y_axis.title = 'Value'
-            metrics_chart2 = ['EBIT', 'CAPITAL INVESTMENT', 'OPERATIONAL CASHFLOW']
-            for metric in metrics_chart2:
-                for r_idx, row in enumerate(consol_rows, start=2):
-                    if row.material_number.replace('ZZZZZZ_', '') == metric:
-                        data_ref = Reference(ws_overview, min_col=3, max_col=2 + n_periods, min_row=r_idx)
-                        chart2.add_data(data_ref, titles_from_data=False)
-                        chart2.series[-1].title = SeriesLabel(v=metric)
+            # Chart 4 — ROCE Components (PNG embed)
+            _rc_series = {}
+            for _m in ['EBIT', 'CAPITAL INVESTMENT', 'OPERATIONAL CASHFLOW']:
+                for _row in consol_rows:
+                    if _row.material_number.replace('ZZZZZZ_', '') == _m:
+                        _rc_series[_m] = [_row.get_value(p) for p in self.data.periods]
                         break
-            chart2.set_categories(cats)
-            ws_overview.add_chart(chart2, 'A' + str(_chart_base + 90))
+            _rc_img = _XLImage(_cr.roce_components(self.data.periods, _rc_series))
+            _rc_img.anchor = 'A' + str(_chart_base + 90)
+            ws_overview.add_image(_rc_img)
 
-            # Chart 5 — ROCE bar with dashed 15% target + green average line (VBA step 145)
-            chart3 = BarChart()
-            chart3.title = 'ROCE'
-            chart3.width = 20
-            chart3.height = 12
-            for r_idx, row in enumerate(consol_rows, start=2):
-                if 'ROCE' in row.material_number and 'CAPITAL' not in row.material_number:
-                    roce_ref = Reference(ws_overview, min_col=3, max_col=2 + n_periods, min_row=r_idx)
-                    chart3.add_data(roce_ref, titles_from_data=False)
-                    chart3.series[-1].title = SeriesLabel(v='ROCE')
+            # Chart 5 — ROCE bar + 15% target + average line (PNG embed)
+            _roce_vals = []
+            for _row in consol_rows:
+                if 'ROCE' in _row.material_number and 'CAPITAL' not in _row.material_number:
+                    _roce_vals = [_row.get_value(p) for p in self.data.periods]
                     break
-            chart3.set_categories(cats)
-            target_ref = Reference(ws_overview, min_col=3, max_col=2 + n_periods, min_row=target_row)
-            line_overlay = LineChart()
-            line_overlay.add_data(target_ref, titles_from_data=False)
-            line_overlay.series[0].title = SeriesLabel(v='Target 15%')
-            line_overlay.series[0].graphicalProperties.line.dashStyle = 'dash'
-            line_overlay.series[0].graphicalProperties.line.solidFill = 'FF0000'
-            # Green ROCE average line (VBA lines 3209-3222, RGB(160,208,120)=A0D078, weight 2)
-            avg_ref = Reference(ws_overview, min_col=3, max_col=2 + n_periods, min_row=roce_avg_row)
-            avg_line = LineChart()
-            avg_line.add_data(avg_ref, titles_from_data=False)
-            avg_line.series[0].title = SeriesLabel(v='ROCE average')
-            avg_line.series[0].graphicalProperties.line.solidFill = 'A0D078'
-            avg_line.series[0].graphicalProperties.line.width = 19050  # weight 2 ≈ 1.5pt in EMU
-            chart3 += line_overlay
-            chart3 += avg_line
-            ws_overview.add_chart(chart3, 'A' + str(_chart_base + 114))
+            _rb_img = _XLImage(_cr.roce_bar(
+                self.data.periods, _roce_vals, target=0.15, average=_roce_avg_val
+            ))
+            _rb_img.anchor = 'A' + str(_chart_base + 114)
+            ws_overview.add_image(_rb_img)
 
             # ---- Top 10 Overstocks sheet (VBA CreateTop10OverstocksChart line 7116) ----
             top10_count = 0
@@ -728,28 +744,18 @@ class PlanningEngine:
                             from openpyxl.utils import get_column_letter
                             ws_t10.column_dimensions[get_column_letter(mi)].width = 18
 
-                        # Chart: vertical stacked (xlColumnStacked), X-axis = periods, series = materials
-                        # VBA: CreateTop10OverstocksChart line 7116, legend at bottom (xlLegendPositionBottom)
-                        from openpyxl.chart import BarChart, Reference
-                        chart_t10 = BarChart()
-                        chart_t10.type = 'col'
-                        chart_t10.grouping = 'stacked'
-                        chart_t10.overlap = 100
-                        chart_t10.title = 'Top 10 Overstocks'
-                        chart_t10.y_axis.title = 'Value (€)'
-                        chart_t10.y_axis.numFmt = '€#,##0'
-                        chart_t10.width = 25
-                        chart_t10.height = 15
-                        chart_t10.legend.position = 'b'
-
+                        # Chart: Top 10 Overstocks stacked bar (PNG embed)
+                        _t10_mats = []
+                        for _item in top10_sorted:
+                            _vals = []
+                            for _p in t10_periods:
+                                _pd = _item.get('periods', {}).get(_p, {})
+                                _vals.append(float(_pd.get('overstock', 0)) if isinstance(_pd, dict) else 0.0)
+                            _t10_mats.append({'name': _item.get('material_name') or _item['material_number'], 'values': _vals})
+                        _t10_img = _XLImage(_cr.top10_overstocks(t10_periods, _t10_mats))
                         max_row = 1 + num_p
-                        for col_idx in range(2, num_mats + 2):
-                            data_ref = Reference(ws_t10, min_col=col_idx, min_row=1, max_row=max_row)
-                            chart_t10.add_data(data_ref, titles_from_data=True)
-                        cats_t10 = Reference(ws_t10, min_col=1, min_row=2, max_row=max_row)
-                        chart_t10.set_categories(cats_t10)
-
-                        ws_t10.add_chart(chart_t10, 'A' + str(max_row + 2))
+                        _t10_img.anchor = 'A' + str(max_row + 2)
+                        ws_t10.add_image(_t10_img)
                         top10_count = num_mats
             except Exception as e:
                 print(f"  Warning: Top 10 overstocks sheet skipped: {e}")
@@ -818,121 +824,45 @@ class PlanningEngine:
                         num_iq_p = len(iq_periods)
                         max_iq_row = 1 + num_iq_p
 
-                        # --- Stacked bar chart (5 bands: Under, Safety, Strategic, Normal, Overstock) ---
-                        from openpyxl.chart import BarChart, LineChart, Reference, Series
-                        from openpyxl.chart.series import SeriesLabel
-                        from openpyxl.drawing.fill import PatternFillProperties
-
-                        BAND_COLS = [
-                            (2, 'C00000'),  # Under
-                            (3, '196B24'),  # Safety Stock
-                            (4, 'BE8C00'),  # Strategic Stock
-                            (5, 'FFC000'),  # Normal Variation
-                            (6, 'FF0000'),  # Overstock
-                        ]
-
-                        bar_iq = BarChart()
-                        bar_iq.type = 'col'
-                        bar_iq.grouping = 'stacked'
-                        bar_iq.overlap = 100
-                        bar_iq.title = 'Inventory quality'
-                        bar_iq.y_axis.title = 'Value (€)'
-                        bar_iq.y_axis.numFmt = '€#,##0'
-                        bar_iq.width = 30
-                        bar_iq.height = 18
-                        bar_iq.legend.position = 'b'
-
-                        for col_idx, hex_color in BAND_COLS:
-                            data_ref = Reference(ws_iq, min_col=col_idx, min_row=1, max_row=max_iq_row)
-                            bar_iq.add_data(data_ref, titles_from_data=True)
-                            s = bar_iq.series[-1]
-                            s.graphicalProperties.solidFill = hex_color
-                            s.graphicalProperties.line.solidFill = hex_color
-
-                        cats_iq = Reference(ws_iq, min_col=1, min_row=2, max_row=max_iq_row)
-                        bar_iq.set_categories(cats_iq)
-
-                        # --- Line chart overlay (Actual Stock + CoGS) ---
-                        line_iq = LineChart()
-                        line_iq.grouping = 'standard'
-
-                        act_ref = Reference(ws_iq, min_col=7, min_row=1, max_row=max_iq_row)
-                        line_iq.add_data(act_ref, titles_from_data=True)
-                        s_act = line_iq.series[-1]
-                        s_act.graphicalProperties.line.solidFill = '800080'
-                        s_act.graphicalProperties.line.width = 19050  # 1.5pt in EMU
-
-                        cog_ref = Reference(ws_iq, min_col=8, min_row=1, max_row=max_iq_row)
-                        line_iq.add_data(cog_ref, titles_from_data=True)
-                        s_cog = line_iq.series[-1]
-                        s_cog.graphicalProperties.line.solidFill = 'ADD8E6'
-                        s_cog.graphicalProperties.line.width = 38100  # 3pt in EMU
-
-                        # Combine: bar + line
-                        bar_iq += line_iq
-                        ws_iq.add_chart(bar_iq, 'A' + str(max_iq_row + 2))
+                        # --- Inventory Quality chart (PNG embed) ---
+                        _iq_bands = {
+                            band: [round(period_totals.get(p, {}).get(band, 0), 0)
+                                   for p in iq_periods]
+                            for band in ('under', 'safety', 'strategic', 'normal', 'overstock')
+                        }
+                        _iq_actual = [round(period_totals.get(p, {}).get('inventory', 0), 0)
+                                      for p in iq_periods]
+                        _iq_cogs = []
+                        for _p in iq_periods:
+                            try:
+                                _iq_cogs.append(float(cogs_row.values[_p]) if cogs_row and _p in cogs_row.values else 0.0)
+                            except (TypeError, ValueError):
+                                _iq_cogs.append(0.0)
+                        _iq_img = _XLImage(_cr.inventory_quality(
+                            iq_periods, _iq_bands, _iq_actual, _iq_cogs
+                        ))
+                        _iq_img.anchor = 'A' + str(max_iq_row + 2)
+                        ws_iq.add_image(_iq_img)
                         iq_chart_done = True
             except Exception as e:
                 print(f"  Warning: Inventory quality chart sheet skipped: {e}")
 
-            # ---- High-level overview (Phase 2) — charts 2 & 3 (VBA lines 3049-3091) ----
-            # Source sheets now exist in the workbook; recreate charts referencing their cells.
+            # ---- High-level overview (Phase 2) — IQ and Top 10 PNG copies ----
             try:
-                _ws_iq_ov = wb['Inventory quality chart'] if 'Inventory quality chart' in wb.sheetnames else None
-                if _ws_iq_ov is not None:
-                    _iq_ov_max = _ws_iq_ov.max_row
-                    from openpyxl.chart import BarChart as _BC2, LineChart as _LC2, Reference as _Ref2
-                    from openpyxl.chart.series import SeriesLabel as _SL2
-                    # Chart 2 — stacked bar + line overlay (same as dedicated sheet)
-                    _ov_iq = _BC2()
-                    _ov_iq.type = 'col'
-                    _ov_iq.grouping = 'stacked'
-                    _ov_iq.overlap = 100
-                    _ov_iq.title = 'Inventory quality'
-                    _ov_iq.y_axis.numFmt = '€#,##0'
-                    _ov_iq.width = 30
-                    _ov_iq.height = 18
-                    _ov_iq.legend.position = 'b'
-                    for _ci, _hx in [(2, 'C00000'), (3, '196B24'), (4, 'BE8C00'), (5, 'FFC000'), (6, 'FF0000')]:
-                        _r2 = _Ref2(_ws_iq_ov, min_col=_ci, min_row=1, max_row=_iq_ov_max)
-                        _ov_iq.add_data(_r2, titles_from_data=True)
-                        _s2 = _ov_iq.series[-1]
-                        _s2.graphicalProperties.solidFill = _hx
-                        _s2.graphicalProperties.line.solidFill = _hx
-                    _ov_iq.set_categories(_Ref2(_ws_iq_ov, min_col=1, min_row=2, max_row=_iq_ov_max))
-                    _ov_iq_line = _LC2()
-                    for _ci, _hx, _lw in [(7, '800080', 19050), (8, 'ADD8E6', 38100)]:
-                        _r2 = _Ref2(_ws_iq_ov, min_col=_ci, min_row=1, max_row=_iq_ov_max)
-                        _ov_iq_line.add_data(_r2, titles_from_data=True)
-                        _sl2 = _ov_iq_line.series[-1]
-                        _sl2.graphicalProperties.line.solidFill = _hx
-                        _sl2.graphicalProperties.line.width = _lw
-                    _ov_iq += _ov_iq_line
-                    ws_overview.add_chart(_ov_iq, _ov_chart2_anchor)
+                if iq_chart_done:
+                    _ov_iq_img = _XLImage(_cr.inventory_quality(
+                        iq_periods, _iq_bands, _iq_actual, _iq_cogs
+                    ))
+                    _ov_iq_img.anchor = _ov_chart2_anchor
+                    ws_overview.add_image(_ov_iq_img)
             except Exception as _e2:
                 print(f"  Warning: Overview inventory quality chart skipped: {_e2}")
 
             try:
-                _ws_t10_ov = wb['Top 10 overstocks'] if 'Top 10 overstocks' in wb.sheetnames else None
-                if _ws_t10_ov is not None:
-                    _t10_ov_max_r = _ws_t10_ov.max_row
-                    _t10_ov_max_c = _ws_t10_ov.max_column
-                    from openpyxl.chart import BarChart as _BC3, Reference as _Ref3
-                    # Chart 3 — stacked bar, legend=right (VBA xlLegendPositionRight for overview copy)
-                    _ov_t10 = _BC3()
-                    _ov_t10.type = 'col'
-                    _ov_t10.grouping = 'stacked'
-                    _ov_t10.overlap = 100
-                    _ov_t10.title = 'Top 10 Overstocks'
-                    _ov_t10.y_axis.numFmt = '€#,##0'
-                    _ov_t10.width = 25
-                    _ov_t10.height = 15
-                    _ov_t10.legend.position = 'r'
-                    for _ci in range(2, _t10_ov_max_c + 1):
-                        _r3 = _Ref3(_ws_t10_ov, min_col=_ci, min_row=1, max_row=_t10_ov_max_r)
-                        _ov_t10.add_data(_r3, titles_from_data=True)
-                    _ov_t10.set_categories(_Ref3(_ws_t10_ov, min_col=1, min_row=2, max_row=_t10_ov_max_r))
-                    ws_overview.add_chart(_ov_t10, _ov_chart3_anchor)
+                if top10_count:
+                    _ov_t10_img = _XLImage(_cr.top10_overstocks(t10_periods, _t10_mats))
+                    _ov_t10_img.anchor = _ov_chart3_anchor
+                    ws_overview.add_image(_ov_t10_img)
             except Exception as _e3:
                 print(f"  Warning: Overview Top 10 chart skipped: {_e3}")
 
@@ -950,43 +880,14 @@ class PlanningEngine:
                         # --- scatter chart: Current vs Previous inventory ---
                         _scatter_data = _mom_eng.create_scatter_data()
                         if _scatter_data['materials']:
-                            # Write scatter source data to a helper sheet
-                            _scat_df = pd.DataFrame({
-                                'Material': _scatter_data['materials'],
-                                'Previous Inventory': _scatter_data['previous'],
-                                'Current Inventory': _scatter_data['current'],
-                            })
-                            _scat_df.to_excel(writer, sheet_name='MoM Scatter Data', index=False)
-                            _ws_scat = writer.sheets['MoM Scatter Data']
-
-                            from openpyxl.chart import ScatterChart as _ScatChart, Reference as _ScatRef, Series as _ScatSeries
-                            from openpyxl.chart.marker import Marker as _Marker
-                            from openpyxl.drawing.fill import PatternFillProperties as _PFP, ColorChoice as _CC
-
-                            _scat_max_r = _scat_df.shape[0] + 1
-                            _sc = _ScatChart()
-                            _sc.title = 'MoM Inventory Scatter'
-                            _sc.x_axis.title = 'Previous Cycle Inventory'
-                            _sc.y_axis.title = 'Current Cycle Inventory'
-                            _sc.width = 25
-                            _sc.height = 15
-                            _sc.style = 13
-
-                            _x_vals = _ScatRef(_ws_scat, min_col=2, min_row=2, max_row=_scat_max_r)
-                            _y_vals = _ScatRef(_ws_scat, min_col=3, min_row=2, max_row=_scat_max_r)
-                            _series = _ScatSeries(_y_vals, _x_vals, title='Materials')
-                            _series.graphicalProperties.line.noFill = True  # no connecting line
-                            _sc.series.append(_series)
-
-                            # Apply per-point colours from quadrant logic
-                            for _pi, _hex_col in enumerate(_scatter_data['colors']):
-                                from openpyxl.chart.series import DataPoint as _DP
-                                from openpyxl.drawing.fill import PatternFillProperties, ColorChoice
-                                _dp = _DP(idx=_pi)
-                                _dp.graphicalProperties.solidFill = _hex_col
-                                _series.data_points.append(_dp)
-
-                            _ws_mom.add_chart(_sc, 'J2')
+                            _scat_img = _XLImage(_cr.mom_scatter(
+                                _scatter_data['materials'],
+                                _scatter_data['previous'],
+                                _scatter_data['current'],
+                                _scatter_data['colors'],
+                            ))
+                            _scat_img.anchor = 'J2'
+                            _ws_mom.add_image(_scat_img)
                         mom_done = True
                 except Exception as _e_mom:
                     print(f"  Warning: MoM comparison sheet skipped: {_e_mom}")

@@ -191,6 +191,24 @@ def _engine_to_comparable(engine) -> dict:
     return dict(sorted(out.items()))
 
 
+def _value_results_to_comparable(engine) -> dict:
+    out: dict = {}
+    for line_type, rows in engine.value_results.items():
+        per_line: dict = {}
+        for row in rows:
+            key = (
+                row.material_number,
+                str(getattr(row, 'aux_column', '') or ''),
+                str(getattr(row, 'aux_2_column', '') or ''),
+            )
+            per_line[key] = {
+                period: round(value, 6)
+                for period, value in sorted(row.values.items())
+            }
+        out[line_type] = dict(sorted(per_line.items()))
+    return dict(sorted(out.items()))
+
+
 def _rounded_utilization_by_machine(engine) -> dict:
     from modules.models import LineType
 
@@ -263,10 +281,12 @@ def test_cross_tab_consistency(golden_fixture_path):
     from modules.models import LineType
     from modules.planning_engine import PlanningEngine
     from ui.app import (
-        SHIFT_HOURS_LOOKUP_FALLBACK,
-        _apply_volume_change,
         _machine_overrides_from_engine,
         app,
+    )
+    from ui.volume_change import (
+        SHIFT_HOURS_LOOKUP_FALLBACK,
+        apply_volume_change as _apply_volume_change,
     )
     from ui.routes.machines import create_machines_blueprint
 
@@ -427,11 +447,13 @@ def test_replay_matches_live_edits(golden_fixture_path):
     from modules.planning_engine import PlanningEngine
     from ui.app import (
         _apply_machine_overrides,
-        _apply_volume_change,
-        _recalculate_capacity_and_values,
         app,
     )
     from ui.replay import replay_pending_edits
+    from ui.volume_change import (
+        apply_volume_change as _apply_volume_change,
+        recalculate_capacity_and_values as _recalculate_capacity_and_values,
+    )
 
     # --- Build engine A ---------------------------------------------------
     engine_a = PlanningEngine(
@@ -503,6 +525,7 @@ def test_replay_matches_live_edits(golden_fixture_path):
         )
 
     live_results = _engine_to_comparable(engine_a)
+    live_value_results = _value_results_to_comparable(engine_a)
 
     # --- Build engine B (fresh) and replay --------------------------------
     engine_b = PlanningEngine(
@@ -531,14 +554,23 @@ def test_replay_matches_live_edits(golden_fixture_path):
         )
 
     replayed_results = _engine_to_comparable(engine_b)
+    replayed_value_results = _value_results_to_comparable(engine_b)
 
     # --- Assertions -------------------------------------------------------
+    assert list(sess_a['pending_edits']) == list(sess_b['pending_edits']), (
+        "Replay setup changed pending_edits insertion order, which would make "
+        "combined edits replay in a different sequence."
+    )
     assert live_results == replayed_results, (
         "Replay invariant broken: replayed results differ from live results.\n"
         f"Edit 1: {LineType.DEMAND_FORECAST.value} / {edit1_row.material_number}"
         f" / {edit1_period}: {edit1_orig} -> {edit1_orig * 1.5}\n"
         f"Edit 2: {LineType.PRODUCTION_PLAN.value} / {edit2_row.material_number}"
         f" / {edit2_period}: {edit2_orig} -> {edit2_orig + 100}\n"
+        f"pending_edits keys: {list(sess_a['pending_edits'].keys())}"
+    )
+    assert live_value_results == replayed_value_results, (
+        "Replay invariant broken: replayed value_results differ from live value_results.\n"
         f"pending_edits keys: {list(sess_a['pending_edits'].keys())}"
     )
     # Sanity: if this triggers, replay made no changes — the test would be vacuous.
