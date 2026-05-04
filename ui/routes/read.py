@@ -1,11 +1,14 @@
 """Read-only result and dashboard routes."""
 
+import logging
 from typing import Callable
 
 from flask import Blueprint, jsonify
 
 from modules.inventory_quality_engine import InventoryQualityEngine
 from modules.models import LineType
+
+logger = logging.getLogger(__name__)
 
 
 def create_read_blueprint(
@@ -152,7 +155,7 @@ def create_read_blueprint(
             top_10_overstocks = iq_result.get('top_10_overstocks', [])
             total_overstock = iq_result.get('total_overstock', 0.0)
         except Exception:
-            pass
+            logger.exception("InventoryQualityEngine failed; dashboard will show empty quality data")
 
         demand_trend = {}
         for row in current_engine.results.get(LineType.TOTAL_DEMAND.value, []):

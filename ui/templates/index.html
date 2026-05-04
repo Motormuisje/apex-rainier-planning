@@ -3189,11 +3189,24 @@ function renderKPIOverviewTable(financials, periods) {
     };
     const calcValFull = (data, n, key, pct) => {
         const p = periods.slice(0, n);
-        if (pct) {
+        // VBA: ROCE = EBIT_sum / CI_avg (not avg of per-period ROCE values)
+        if (key === 'ROCE') {
+            const ebitData = financials['EBIT'];
+            const ciData = financials['CAPITAL INVESTMENT'];
+            if (ebitData && ciData) {
+                const ebitSum = p.reduce((s, x) => s + (ebitData[x] || 0), 0);
+                const ciAvg = p.reduce((s, x) => s + (ciData[x] || 0), 0) / (p.length || 1);
+                return ciAvg !== 0 ? ebitSum / ciAvg : 0;
+            }
             const vals = p.map(x => data[x] || 0).filter(v => v !== 0);
             return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
         }
-        if (BALANCE.has(key)) return data[p[p.length - 1]] || 0;
+        // VBA: balance sheet items use AVERAGE; INVENTORY VALUE includes starting stock
+        if (BALANCE.has(key)) {
+            const pts = key === 'INVENTORY VALUE' ? ['Starting stock', ...p] : p;
+            const sum = pts.reduce((s, x) => s + (data[x] || 0), 0);
+            return pts.length ? sum / pts.length : 0;
+        }
         return p.reduce((s, x) => s + (data[x] || 0), 0);
     };
     const fmtEur = v => '€\u202f' + Math.round(v).toLocaleString('nl-NL');
@@ -3254,16 +3267,16 @@ function renderInvQualityChart(invQuality, periods, financials) {
         : null;
 
     const datasets = [
-        { label: 'Understock',    data: toData(agg.under),     backgroundColor: 'rgba(220,38,38,0.85)',  stack: 'under' },
-        { label: 'Safety stock',  data: toData(agg.safety),    backgroundColor: 'rgba(21,128,61,0.85)',  stack: 'inv' },
-        { label: 'Strategic',     data: toData(agg.strategic), backgroundColor: 'rgba(217,119,6,0.85)',  stack: 'inv' },
-        { label: 'Normal',        data: toData(agg.normal),    backgroundColor: 'rgba(234,179,8,0.85)',  stack: 'inv' },
-        { label: 'Overstock',     data: toData(agg.overstock), backgroundColor: 'rgba(248,113,113,0.85)',stack: 'inv' },
-        { label: 'Actual stock',  data: toData(agg.inventory), type: 'line', borderColor: '#a855f7', backgroundColor: 'transparent', borderWidth: 2, pointRadius: 2, fill: false, stack: undefined,
+        { label: 'Understock',    data: toData(agg.under),     backgroundColor: 'rgba(220,38,38,0.85)',  stack: 'under', order: 2 },
+        { label: 'Safety stock',  data: toData(agg.safety),    backgroundColor: 'rgba(21,128,61,0.85)',  stack: 'inv',   order: 2 },
+        { label: 'Strategic',     data: toData(agg.strategic), backgroundColor: 'rgba(217,119,6,0.85)',  stack: 'inv',   order: 2 },
+        { label: 'Normal',        data: toData(agg.normal),    backgroundColor: 'rgba(234,179,8,0.85)',  stack: 'inv',   order: 2 },
+        { label: 'Overstock',     data: toData(agg.overstock), backgroundColor: 'rgba(248,113,113,0.85)',stack: 'inv',   order: 2 },
+        { label: 'Actual stock',  data: toData(agg.inventory), type: 'line', borderColor: '#a855f7', backgroundColor: 'transparent', borderWidth: 2, pointRadius: 2, fill: false, stack: 'line_actual', order: 1,
           datalabels: { display: true, align: 'top', anchor: 'end', color: '#c4b5fd', font: { size: 8 },
             formatter: v => v == null ? '' : Math.round(v * 1000).toLocaleString('nl-NL') } },
     ];
-    if (cogData) datasets.push({ label: 'Cost of Goods', data: cogData, type: 'line', borderColor: '#7dd3fc', backgroundColor: 'transparent', borderWidth: 1.5, pointRadius: 0, borderDash: [4,3], fill: false, stack: undefined,
+    if (cogData) datasets.push({ label: 'Cost of Goods', data: cogData, type: 'line', borderColor: '#7dd3fc', backgroundColor: 'transparent', borderWidth: 1.5, pointRadius: 3, pointBackgroundColor: '#7dd3fc', borderDash: [4,3], fill: false, stack: 'line_cog', spanGaps: false, order: 0,
         datalabels: { display: false } });
 
     window._invQualityChart = new Chart(canvas.getContext('2d'), {
@@ -6973,6 +6986,7 @@ function renderFteTable() {
     }
     const periods = _machinesData.periods || [];
     const groups = _machinesData.groups || [];
+    const fteExtra = _machinesData.fte_extra || [];
     const fteTotals = _machinesData.fte_totals_by_period || {};
 
     head.innerHTML = `
@@ -6992,6 +7006,16 @@ function renderFteTable() {
         </tr>`;
     }).join('');
 
+    const extraRows = fteExtra.map(g => {
+        const per = g.fte_by_period || {};
+        const cells = periods.map(p => `<td class="text-center text-purple-300">${(per[p] || 0).toFixed(2)}</td>`).join('');
+        return `<tr>
+            <td class="font-mono text-purple-400">${escapeHtml(g.group)}</td>
+            ${cells}
+            <td class="text-center font-semibold text-purple-300">${(g.fte_avg || 0).toFixed(2)}</td>
+        </tr>`;
+    }).join('');
+
     const totalVals = periods.map(p => fteTotals[p] || 0);
     const totalAvg = totalVals.length ? totalVals.reduce((a, b) => a + b, 0) / totalVals.length : 0;
     const totalRow = `<tr style="border-top:1px solid #334155;">
@@ -7000,7 +7024,7 @@ function renderFteTable() {
         <td class="text-center font-bold text-slate-100">${totalAvg.toFixed(2)}</td>
     </tr>`;
 
-    body.innerHTML = (groupRows || '') + totalRow;
+    body.innerHTML = groupRows + extraRows + totalRow;
 }
 
 function escapeHtml(s) {

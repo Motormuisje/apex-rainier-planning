@@ -106,7 +106,11 @@ def create_machines_blueprint(
             if row.product_type == 'Machine' and row.material_name in data.machines:
                 req_hours_by_machine[row.material_name] = row.values
 
-        fte_rows = current_engine.results.get(LineType.FTE_REQUIREMENTS.value, [])
+        # Deduplicate FTE rows by material_number; duplicates are a BOM artifact — keep last (most downstream)
+        _fte_dedup = {}
+        for row in current_engine.results.get(LineType.FTE_REQUIREMENTS.value, []):
+            _fte_dedup[row.material_number] = row
+        fte_rows = list(_fte_dedup.values())
         fte_by_group = {row.material_number: row.values for row in fte_rows}
 
         if not hasattr(current_engine, 'machine_throughput_theo') or not hasattr(current_engine, 'output_by_machine_period'):
@@ -233,10 +237,23 @@ def create_machines_blueprint(
                 fte_totals[period] += row.values.get(period, 0.0)
         fte_totals = {period: round(value, 2) for period, value in fte_totals.items()}
 
+        # FTE rows for truck groups / control room (not covered by any machine group)
+        known_groups = {g['group'] for g in groups_out}
+        fte_extra = []
+        for row in fte_rows:
+            if row.material_number not in known_groups:
+                fte_p = {period: round(row.values.get(period, 0.0), 2) for period in periods}
+                fte_extra.append({
+                    'group': row.material_number,
+                    'fte_by_period': fte_p,
+                    'fte_avg': round(_avg(fte_p), 2),
+                })
+
         return jsonify({
             'periods': periods,
             'machines': machines_out,
             'groups': groups_out,
+            'fte_extra': fte_extra,
             'fte_totals_by_period': fte_totals,
             'machine_overrides': machine_overrides,
             'undo_depth': len(sess.get('machine_undo') or []),

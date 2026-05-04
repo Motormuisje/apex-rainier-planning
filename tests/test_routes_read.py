@@ -81,6 +81,46 @@ def test_dashboard_returns_kpis_and_chart_shapes(read_route_app):
     assert isinstance(payload["target_trend"], dict)
 
 
+def test_dashboard_kpi_values_are_numeric_and_in_range(read_route_app):
+    response = read_route_app.client.get("/api/dashboard")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    kpis = payload["kpis"]
+    periods = payload["periods"]
+
+    assert isinstance(kpis["materials"], int) and kpis["materials"] > 0
+    assert 0.0 <= kpis["avg_utilization"] <= 100.0
+    assert kpis["total_fte"] >= 0.0
+    assert kpis["total_overstock"] >= 0.0
+
+    for trend_key in ("demand_trend", "inventory_trend", "target_trend"):
+        trend = payload[trend_key]
+        assert set(trend.keys()) == set(periods), f"{trend_key} periods mismatch"
+        for val in trend.values():
+            assert isinstance(val, (int, float)), f"{trend_key} value is not numeric: {val}"
+
+
+def test_dashboard_inventory_quality_structure(read_route_app):
+    response = read_route_app.client.get("/api/dashboard")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    iq = payload["inventory_quality"]
+    assert isinstance(iq, list)
+
+    for entry in iq:
+        assert "material_number" in entry
+        assert "total_overstock" in entry
+        assert "starting_overstock" in entry
+        assert "periods" in entry
+        assert "Starting stock" in entry["periods"], (
+            f"'Starting stock' missing from periods for {entry['material_number']} "
+            "— regression of starting stock categorization bug"
+        )
+        assert isinstance(entry["total_overstock"], (int, float))
+
+
 def test_capacity_returns_utilization_rows(read_route_app):
     response = read_route_app.client.get("/api/capacity")
 

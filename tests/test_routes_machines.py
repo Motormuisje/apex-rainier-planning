@@ -351,3 +351,38 @@ def test_redo_machine_param_reapplies_shift_hours(machines_route_app):
     assert machines_route_app.sess["machine_undo"] == [
         {"machine": "M1", "field": "shift_hours", "old_value": None, "new_value": 700.0},
     ]
+
+
+def test_get_machines_fte_deduplication_last_row_wins(machines_route_app):
+    # Two FTE rows with the same material_number — dedup keeps last; fte_totals reflects last only
+    machines_route_app.engine.results[LineType.FTE_REQUIREMENTS.value] = [
+        _row(LineType.FTE_REQUIREMENTS.value, material_number="Group A", values={"2025-12": 1.25, "2026-01": 1.75}),
+        _row(LineType.FTE_REQUIREMENTS.value, material_number="Group A", values={"2025-12": 3.00, "2026-01": 4.00}),
+    ]
+
+    response = machines_route_app.client.get("/api/machines")
+
+    assert response.status_code == 200, response.get_json(silent=True)
+    payload = response.get_json()
+    # fte_totals must reflect deduplicated row (last: 3.0/4.0), not the sum (4.25/5.75)
+    assert payload["fte_totals_by_period"]["2025-12"] == pytest.approx(3.0)
+    assert payload["fte_totals_by_period"]["2026-01"] == pytest.approx(4.0)
+
+
+def test_get_machines_fte_extra_includes_non_machine_groups(machines_route_app):
+    # Add a truck-group FTE row whose material_number doesn't match any machine group
+    machines_route_app.engine.results[LineType.FTE_REQUIREMENTS.value] = [
+        _row(LineType.FTE_REQUIREMENTS.value, material_number="Group A", values={"2025-12": 1.25, "2026-01": 1.75}),
+        _row(LineType.FTE_REQUIREMENTS.value, material_number="ZZZZ_TRUCK01", values={"2025-12": 0.5, "2026-01": 0.75}),
+    ]
+
+    response = machines_route_app.client.get("/api/machines")
+
+    assert response.status_code == 200, response.get_json(silent=True)
+    payload = response.get_json()
+
+    extra_groups = [e["group"] for e in payload["fte_extra"]]
+    assert "ZZZZ_TRUCK01" in extra_groups
+
+    machine_groups = [g["group"] for g in payload["groups"]]
+    assert "ZZZZ_TRUCK01" not in machine_groups
